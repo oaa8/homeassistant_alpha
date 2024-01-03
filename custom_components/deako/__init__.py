@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 
+import atomics
+import pydeako
 from pydeako.deako import Deako, DeviceListTimeout, FindDevicesTimeout
 from pydeako.discover import DeakoDiscoverer
 
@@ -18,10 +20,15 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 PLATFORMS: list[Platform] = [Platform.LIGHT]
 
+ATOMIC_BOOL_FALSE = 0
+ATOMIC_BOOL_TRUE = 1
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up deako from a config entry."""
     entry.async_on_unload(entry.add_update_listener(update_listener))
+    # Hack to make help avoid calling a good connection a bad one
+    pydeako.deako._deako.DEVICE_FOUND_POLLING_INTERVAL_S = 60
 
     await _initiate_connection(hass, entry)
 
@@ -30,7 +37,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    await hass.data[DOMAIN][entry.entry_id].disconnect()
+    if hass.data.get(DOMAIN, {}).get(entry.entry_id) is not None:
+        await hass.data[DOMAIN][entry.entry_id].disconnect()
 
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
@@ -98,6 +106,11 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await connection.disconnect()
         raise ConfigEntryNotReady(devices)
 
+    # Quick hack to get manage refreshes
+    connection.is_refreshing = atomics.atomic(1, atomics.INT)
+    connection.is_refreshing.store(ATOMIC_BOOL_FALSE)
+    connection.is_additional_refresh_requested = atomics.atomic(1, atomics.INT)
+    connection.is_additional_refresh_requested.store(ATOMIC_BOOL_FALSE)
     hass.data[DOMAIN][entry.entry_id] = connection
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

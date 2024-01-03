@@ -17,7 +17,7 @@
     ],
     "requirements": [
         "pydeako==0.3.1",
-        "atomicx==0.0.12"
+        "atomics==1.0.2"
     ],
     "zeroconf": [
         "_deako._tcp.local."
