@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 import atomics
 import pydeako
@@ -22,6 +23,8 @@ PLATFORMS: list[Platform] = [Platform.LIGHT]
 
 ATOMIC_BOOL_FALSE = 0
 ATOMIC_BOOL_TRUE = 1
+
+TELNET_MESSAGE_DELAY = "telnet_message_receive_delay"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -49,20 +52,69 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update Deako listeners."""
 
+    set_delay_options_if_needed(hass, entry)
+    preset_adddress_or_none = await get_connection_address(hass, entry)
+
     connection = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+
+    should_reconnect = False
     if connection is not None:
-        hass.data[DOMAIN].pop(entry.entry_id)
-        await connection.disconnect()
+        if (
+            (
+                connection.__is_address_hardcoded
+                and (
+                    preset_adddress_or_none is None
+                    or connection.__address != await preset_adddress_or_none()
+                )
+            )
+            or not connection.__is_address_hardcoded
+            and preset_adddress_or_none is not None
+        ):
+            should_reconnect = True
+    else:
+        should_reconnect = True
 
-    await _initiate_connection(hass, entry)
+    if should_reconnect:
+        if connection is not None:
+            hass.data[DOMAIN].pop(entry.entry_id)
+            await connection.disconnect()
+        await _initiate_connection(hass, entry)
 
 
-async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Initiate Deako connection."""
-    hass_data = hass.data.setdefault(DOMAIN, {})
-    if hass_data is None or not isinstance(hass_data, dict):
-        hass_data = {}
-        hass.data[DOMAIN] = hass_data
+def set_delay_options_if_needed(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Set the options if needed."""
+
+    telnet_message_delay = None
+    if (
+        entry.options is not None
+        and entry.options.get(TELNET_MESSAGE_DELAY) is not None
+    ):
+        telnet_message_delay = entry.options.get(TELNET_MESSAGE_DELAY)
+    elif entry.data is not None and entry.data.get(TELNET_MESSAGE_DELAY) is not None:
+        telnet_message_delay = entry.data.get(TELNET_MESSAGE_DELAY)
+
+    if telnet_message_delay is not None:
+        value = float(telnet_message_delay)
+        if value < 1e-5:
+            _LOGGER.info(
+                "Requested telnet delay is %s which is close to zero.  Updating it to zero",
+                value,
+            )
+            value = 0
+        _LOGGER.info(
+            "Changing telnet message delay from %s to %s",
+            pydeako.deako._manager.WORKER_WAIT_S,
+            value,
+        )
+        pydeako.deako._manager.WORKER_WAIT_S = value
+
+
+async def get_connection_address(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> Callable[[], str] or None:
+    """Get the connection address."""
+
+    get_address = None
 
     if entry.options is not None:
 
@@ -72,8 +124,43 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
             )
 
         get_address = get_address_method
-
+        _LOGGER.info("Test: %s", await get_address_method())
+        _LOGGER.info("Test: %s", await get_address())
     elif entry.data is not None:
+
+        async def get_address_method() -> str:
+            return f"{entry.data.get(CONF_IP_ADDRESS)}:{entry.data.get(CONF_PORT)}"
+
+        get_address = get_address_method
+        _LOGGER.info("Test: %s", await get_address_method())
+        _LOGGER.info("Test: %s", await get_address())
+    return get_address
+
+
+async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Initiate Deako connection."""
+    hass_data = hass.data.setdefault(DOMAIN, {})
+    if hass_data is None or not isinstance(hass_data, dict):
+        hass_data = {}
+        hass.data[DOMAIN] = hass_data
+
+    telnet_message_delay = None
+    is_address_hardcoded = False
+    if entry.options is not None:
+        is_address_hardcoded = True
+
+        async def get_address_method() -> str:
+            return (
+                f"{entry.options.get(CONF_IP_ADDRESS)}:{entry.options.get(CONF_PORT)}"
+            )
+
+        get_address = get_address_method
+        if entry.options.get(TELNET_MESSAGE_DELAY) is not None:
+            telnet_message_delay = entry.options.get(TELNET_MESSAGE_DELAY)
+    elif entry.data is not None:
+        is_address_hardcoded = True
+        if entry.data.get(TELNET_MESSAGE_DELAY) is not None:
+            telnet_message_delay = entry.data.get(TELNET_MESSAGE_DELAY)
 
         async def get_address_method() -> str:
             return f"{entry.data.get(CONF_IP_ADDRESS)}:{entry.data.get(CONF_PORT)}"
@@ -88,7 +175,12 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         discoverer: DeakoDiscoverer = hass_data.get(DISCOVERER_ID)
         get_address = discoverer.get_address
 
+    set_delay_options_if_needed(hass, entry)
+
     connection = Deako(get_address)
+    if is_address_hardcoded:
+        connection.__is_address_hardcoded = True
+        connection.__address = await get_address()
     await connection.connect()
     try:
         await connection.find_devices()
