@@ -177,15 +177,48 @@ class DeakoLightSwitch(LightEntity):
         ):
             _LOGGER.error("The connection does not seem to be available anymore")
             # PyDeako's maintain_connection_worker() doesn't quite seem to work as desired.  Part of the problem may be due to the state management for the canceling state and the connecting state flags and how they're reset and interpreted.
-            # If a lack of connection is deteced, reload the entier integration.  This will likely fail if it's due to a prolonged disconnection which should create a relatively clear signal in Home Assistant that something is wrong.  Additionally,
-            # Home Assistant will automatically reload the integration periodically which will retry the connection
-            await self.hass.config_entries.async_reload(
-                # TODO:  Confirm that this is an appropriate method for acquiring the integration's ID
-                self.registry_entry.config_entry_id
-            )
-            raise ConfigEntryNotReady("Detected a disconnected state")
+            # await self._reload_integration()
+            await self._attempt_to_restore_connection()
         else:
             _LOGGER.debug("Connection appears to still be available")
+
+    async def _reload_integration(self) -> None:
+        # If a lack of connection is deteced, reload the entier integration.  This will likely fail if it's due to a prolonged disconnection which should create a relatively clear signal in Home Assistant that something is wrong.  Additionally,
+        # Home Assistant will automatically reload the integration periodically which will retry the connection
+        await self.hass.config_entries.async_reload(
+            # TODO:  Confirm that this is an appropriate method for acquiring the integration's ID
+            self.registry_entry.config_entry_id
+        )
+        raise ConfigEntryNotReady("Detected a disconnected state")
+
+    async def _attempt_to_restore_connection(self) -> None:
+        """Attempt to restore the connection."""
+        if self.client.is_reconnecting.cmpxchg_strong(
+            expected=ATOMIC_BOOL_FALSE, desired=ATOMIC_BOOL_TRUE
+        ).success:
+            shouldRetry = True
+            while shouldRetry:
+                _LOGGER.warning("Attempting to restore the connection")
+
+                # Call disconnect to ensure the connection has been closed
+                await self.client.disconnect()
+
+                # Since there are some state management bugs, just replace the entire connection manager instead of trying to externally clean up state
+                self.client.connection_manager = (
+                    self.client.connection_manager.__class__(
+                        self.client.connection_manager.get_address,
+                        self.client.connection_manager.incoming_json_callback,
+                        self.client.connection_manager.client_name,
+                    )
+                )
+
+                # With the new connection manager, initiate a new connection
+                await self.client.connection_manager.init_connection()
+                shouldRetry = self.client.connection_manager.state.connecting
+                # Wait 1 second before retrying
+                await asyncio.sleep(1)
+            self.client.is_reconnecting.store(ATOMIC_BOOL_FALSE)
+            _LOGGER.warning("Connection appears to be restored")
 
     async def refresh_devices(self) -> None:
         """Refresh the device list."""

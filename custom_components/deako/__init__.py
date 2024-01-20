@@ -145,7 +145,6 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         hass_data = {}
         hass.data[DOMAIN] = hass_data
 
-    telnet_message_delay = None
     is_address_hardcoded = False
     if entry.options is not None:
         is_address_hardcoded = True
@@ -156,12 +155,8 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
             )
 
         get_address = get_address_method
-        if entry.options.get(TELNET_MESSAGE_DELAY) is not None:
-            telnet_message_delay = entry.options.get(TELNET_MESSAGE_DELAY)
     elif entry.data is not None:
         is_address_hardcoded = True
-        if entry.data.get(TELNET_MESSAGE_DELAY) is not None:
-            telnet_message_delay = entry.data.get(TELNET_MESSAGE_DELAY)
 
         async def get_address_method() -> str:
             return f"{entry.data.get(CONF_IP_ADDRESS)}:{entry.data.get(CONF_PORT)}"
@@ -187,11 +182,11 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
     try:
         await connection.find_devices()
     except FindDevicesTimeout as exc:
-        _LOGGER.warning("No devices expected")
+        _LOGGER.warning("Timed out finding devices")
         await connection.disconnect()
         raise ConfigEntryNotReady(exc) from exc
     except DeviceListTimeout as exc:
-        _LOGGER.warning("No devices expected")
+        _LOGGER.warning("Unexpectedly received a count of zero devices from the hub")
         await connection.disconnect()
         raise ConfigEntryNotReady(exc) from exc
 
@@ -201,11 +196,16 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         raise ConfigEntryNotReady(devices)
 
     # Quick hack to get manage refreshes
-    connection.is_refreshing = atomics.atomic(1, atomics.INT)
+    connection.is_refreshing = atomics.atomic(width=1, atype=atomics.INT)
     connection.is_refreshing.store(ATOMIC_BOOL_FALSE)
-    connection.is_additional_refresh_requested = atomics.atomic(1, atomics.INT)
+    connection.is_additional_refresh_requested = atomics.atomic(
+        width=1, atype=atomics.INT
+    )
     connection.is_additional_refresh_requested.store(ATOMIC_BOOL_FALSE)
     overwrite_parse_data_implementation(hass, entry, connection)
+    # Quick hack to manage attempts to restore connections
+    connection.is_reconnecting = atomics.atomic(width=1, atype=atomics.INT)
+    connection.is_reconnecting.store(ATOMIC_BOOL_FALSE)
     hass.data[DOMAIN][entry.entry_id] = connection
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
