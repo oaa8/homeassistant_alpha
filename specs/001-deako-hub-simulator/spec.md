@@ -7,7 +7,7 @@
 
 ## Hardware Validation Testing
 
-All functional requirements have been validated against real Deako hub hardware (192.168.86.221:23) through systematic testing. **9 of 10 critical gap tests completed** as of October 18, 2025.
+All functional requirements have been validated against real Deako hub hardware (192.168.86.221:23) through systematic testing. **All 10 critical gap tests completed** as of October 20, 2025.
 
 ### Completed Hardware Tests
 
@@ -22,8 +22,7 @@ All functional requirements have been validated against real Deako hub hardware 
 | **#7: Error Codes** | [error-code-validation-test-2025-10-18.md](./research/error-code-validation-test-2025-10-18.md) | Only 3 of 5 documented codes exist; malformed JSON silently dropped | FR-066, FR-077 |
 | **#8: Message Format** | [message-format-edge-cases-test-2025-10-18.md](./research/message-format-edge-cases-test-2025-10-18.md) | Permissive parsing, uppercase types required, null="no change" | FR-078–FR-083 |
 | **#9: Connection Lifecycle** | [connection-lifecycle-test-2025-10-18.md](./research/connection-lifecycle-test-2025-10-18.md) | No idle timeout (>5 min), immediate reconnect, robust disconnect handling | FR-084–FR-087 |
-
-**Test #10 (Performance Limits)** - Pending
+| **#10: Performance Limits** | [performance-limits-test-2025-10-20.md](./research/performance-limits-test-2025-10-20.md) | Silent degradation after burst (>50 cmd in 5s), 5-200ms response times, ~10 cmd/s max | FR-088–FR-091 |
 
 ### Test Scripts Location
 
@@ -38,6 +37,8 @@ All test scripts: `specs/001-deako-hub-simulator/tests/*.ps1`
 5. **Connection Lifecycle**: No timeout, immediate reconnect, broadcasts to idle connections
 6. **DEVICE_POLL Quirk**: Returns status="error" even on successful query
 7. **EVENT Format**: Always includes full device state (not deltas)
+8. **Protection Mechanism**: Silent degradation after >50 commands in 5 seconds (no disconnect, no errors)
+9. **Performance**: 5-200ms response times, ~10 cmd/s maximum throughput
 
 ## Clarifications
 
@@ -312,6 +313,13 @@ As an integration developer, I want the simulator to provide detailed logging of
 - **FR-085**: Simulator MUST allow immediate reconnection after disconnect with no enforced delay (verified October 2025: real hub accepts new connection < 1 second after previous disconnect); connection resources must be released immediately on close to support rapid reconnect; no "cooldown" period between connections from same client
 - **FR-086**: Simulator MUST handle both graceful (FIN) and ungraceful (RST) client disconnects without crashing or leaking resources (verified October 2025: real hub cleanly handles both TCP graceful shutdown and abrupt socket closure); properly clean up client state, device subscriptions, and buffered messages on disconnect regardless of disconnect method
 - **FR-087**: Simulator MUST buffer incomplete messages (messages without CRLF line ending) until complete line received or connection closes (verified October 2025: real hub buffers incomplete JSON like `{"message":"PING"` without error until CRLF arrives or connection drops); on disconnect with incomplete buffer, discard buffer contents without generating error; maximum buffer size should be reasonable (e.g., 64KB) to prevent memory exhaustion attacks
+
+#### Performance and Protection
+
+- **FR-088**: Simulator MUST implement silent connection degradation protection mechanism matching real hub behavior (verified October 2025: after >50 commands in <5 seconds, hub stops sending responses but maintains TCP connection and continues accepting commands); when burst threshold exceeded (configurable, default: 50 commands in 5-second sliding window), simulator must: (1) maintain TCP connection without disconnect, (2) stop sending all responses including ACKs and EVENTs, (3) continue accepting incoming commands but discard them, (4) remain in degraded state until client disconnects; no automatic recovery or timeout exists on real hardware
+- **FR-089**: Simulator MUST NOT send error notifications when protection mechanism activates (verified October 2025: real hub silently stops responding with no error message, status code, or connection reset); clients are expected to detect unresponsive state via response timeout monitoring; simulator must not send TCP RST, FIN, or any protocol-level error indication when entering protected state
+- **FR-090**: Simulator MUST implement realistic response time variability matching real hub performance characteristics (verified October 2025: typical responses 5-20ms, occasional spikes up to 200ms); simulator should use: base response delay 10-15ms with ±5ms random variance, 1% probability of spike delay (100-200ms range) to simulate real-world processing variations and network latency; configurable via HTTP API for specific timing test scenarios
+- **FR-091**: Simulator MUST accept commands at any input rate without artificial throttling but process responses at maximum ~10 commands/second throughput (verified October 2025: hub accepts commands as fast as sent but response rate limited to ~10 cmd/s); simulator should queue incoming commands and process queue at realistic rate; burst protection (FR-088) overrides this - after protection activates, stop processing queue entirely until disconnect
 
 #### Control Interface
 
@@ -608,6 +616,9 @@ All functional requirements above have been validated through systematic hardwar
 
 9. **[Connection Lifecycle (No timeout, immediate reconnect)](./research/connection-lifecycle-test-2025-10-18.md)** - FR-084 through FR-087  
    Test: [`tests/test-connection-lifecycle.ps1`](./tests/test-connection-lifecycle.ps1)
+
+10. **[Performance Limits (Silent degradation, response timing)](./research/performance-limits-test-2025-10-20.md)** - FR-088 through FR-091  
+   Test: [`tests/test-performance-limits.ps1`](./tests/test-performance-limits.ps1)
 
 ### Testing Statistics
 - **Tests Completed**: 9 of 10
