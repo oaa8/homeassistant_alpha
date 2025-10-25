@@ -42,6 +42,11 @@ All test scripts: `specs/001-deako-hub-simulator/tests/*.ps1`
 
 ## Clarifications
 
+### Session 2025-10-25
+
+- Q: When a device is added (via configuration file or HTTP API) without an explicit initial state, what should the default power and dim values be? → A: Require explicit state - no defaults. When adding a device, state (power and dim) must be explicitly specified. This enforces explicit test scenarios, predictable behavior free of assumptions, and clear intent in test configurations.
+- Q: When a test scenario is activated via the HTTP API (POST /scenario/activate), what should happen to existing devices and active client connections? → A: Replace all devices, keep connections active. Scenario activation atomically replaces the entire device configuration with the scenario's device definitions, but client connections remain active. This mimics real-world behavior where devices can be added/removed from a hub while clients are connected, enabling tests of the integration's ability to handle dynamic device topology changes. Clients must re-query DEVICE_LIST to discover the new device set.
+
 ### Session 2025-10-15
 
 - Q: How should the simulator handle shutdown signals (SIGTERM, SIGINT) from the operating system? → A: Graceful shutdown: Catch signals, close all client connections cleanly, flush logs, then exit within 5 seconds. This aligns with best practices for Python application lifecycle management and enables integration with process managers, container orchestration, and testing frameworks.
@@ -256,7 +261,7 @@ As an integration developer, I want the simulator to provide detailed logging of
 #### Connection Management
 
 - **FR-006**: Simulator MUST accept telnet connections on the configured port; implemented using Python asyncio with non-blocking I/O and async/await syntax for handling connections
-- **FR-072**: Simulator MUST limit functionality to exactly one active telnet connection at a time to match real Deako hub behavior (validated October 2025); when a connection is active, additional TCP connection attempts MAY be accepted but MUST NOT receive protocol responses (passive rejection model matching real hub: accept socket but ignore all messages from non-active connections); only the first established connection processes and responds to messages; alternatively, simulator MAY reject additional connections with TCP RST for simpler implementation (configurable via --connection-mode flag: passive-reject matches real hub, active-reject is simpler); both modes achieve functional single-connection behavior; new connections MUST become functional after the previous active connection closes
+- **FR-072**: Simulator MUST limit functionality to exactly one active telnet connection at a time to match real Deako hub behavior (validated October 2025); when a connection is active, additional TCP connection attempts MAY be accepted but MUST NOT receive protocol responses (passive rejection model matching real hub: accept socket but ignore all messages from non-active connections); only the first established connection processes and responds to messages; new connections MUST become functional after the previous active connection closes
 - **FR-007**: Simulator MUST track which connection is the active connection and only send responses to that connection; zombie connections (accepted but inactive) MUST be logged for debugging but receive no protocol responses
 - **FR-008**: Simulator MUST handle telnet protocol negotiation (IAC sequences) in a manner consistent with real Deako hubs
 - **FR-009**: Simulator MUST detect client disconnections and properly clean up client session state
@@ -265,8 +270,8 @@ As an integration developer, I want the simulator to provide detailed logging of
 #### Device Simulation
 
 - **FR-011**: Simulator MUST support configuration of multiple virtual light devices with unique UUIDs; UUIDs are auto-generated (UUID v4 format) when not explicitly provided in configuration
-- **FR-012**: Each virtual device MUST have configurable properties: UUID (optional, auto-generated if omitted), name, device type (dimmer or smart switch)
-- **FR-013**: Each virtual device MUST maintain internal state including: power (on/off), dim level (0-100 for dimmers only)
+- **FR-012**: Each virtual device MUST have configurable properties: UUID (optional, auto-generated if omitted), name, device type (dimmer or smart switch), initial state (required: power and dim must be explicitly specified)
+- **FR-013**: Each virtual device MUST maintain internal state including: power (on/off), dim level (0-100 for dimmers only); state MUST be explicitly provided when adding devices via configuration file or HTTP API (no default state values to ensure explicit, predictable test scenarios)
 - **FR-014**: Simulator MUST persist device state changes within a session (state survives across multiple queries)
 - **FR-015**: Simulator MUST support runtime addition and removal of virtual devices through control interface
 
@@ -314,13 +319,6 @@ As an integration developer, I want the simulator to provide detailed logging of
 - **FR-086**: Simulator MUST handle both graceful (FIN) and ungraceful (RST) client disconnects without crashing or leaking resources (verified October 2025: real hub cleanly handles both TCP graceful shutdown and abrupt socket closure); properly clean up client state, device subscriptions, and buffered messages on disconnect regardless of disconnect method
 - **FR-087**: Simulator MUST buffer incomplete messages (messages without CRLF line ending) until complete line received or connection closes (verified October 2025: real hub buffers incomplete JSON like `{"message":"PING"` without error until CRLF arrives or connection drops); on disconnect with incomplete buffer, discard buffer contents without generating error; maximum buffer size should be reasonable (e.g., 64KB) to prevent memory exhaustion attacks
 
-#### Performance and Protection
-
-- **FR-088**: Simulator MUST implement silent connection degradation protection mechanism matching real hub behavior (verified October 2025: after >50 commands in <5 seconds, hub stops sending responses but maintains TCP connection and continues accepting commands); when burst threshold exceeded (configurable, default: 50 commands in 5-second sliding window), simulator must: (1) maintain TCP connection without disconnect, (2) stop sending all responses including ACKs and EVENTs, (3) continue accepting incoming commands but discard them, (4) remain in degraded state until client disconnects; no automatic recovery or timeout exists on real hardware
-- **FR-089**: Simulator MUST NOT send error notifications when protection mechanism activates (verified October 2025: real hub silently stops responding with no error message, status code, or connection reset); clients are expected to detect unresponsive state via response timeout monitoring; simulator must not send TCP RST, FIN, or any protocol-level error indication when entering protected state
-- **FR-090**: Simulator MUST implement realistic response time variability matching real hub performance characteristics (verified October 2025: typical responses 5-20ms, occasional spikes up to 200ms); simulator should use: base response delay 10-15ms with ±5ms random variance, 1% probability of spike delay (100-200ms range) to simulate real-world processing variations and network latency; configurable via HTTP API for specific timing test scenarios
-- **FR-091**: Simulator MUST accept commands at any input rate without artificial throttling but process responses at maximum ~10 commands/second throughput (verified October 2025: hub accepts commands as fast as sent but response rate limited to ~10 cmd/s); simulator should queue incoming commands and process queue at realistic rate; burst protection (FR-088) overrides this - after protection activates, stop processing queue entirely until disconnect
-
 #### Control Interface
 
 - **FR-031**: Simulator MUST provide a hybrid control interface consisting of: (1) Configuration file (JSON format) for initial setup, test scenario definitions, and version-controlled reproducible configurations; and (2) HTTP REST API for runtime control, state inspection, scenario activation, and dynamic modifications during test execution. The HTTP API MUST bind to a configurable port (default 8080, separate from telnet port 23) and provide endpoints for all runtime operations (device management, scenario activation, state queries, quirk injection, client management). HTTP API implemented using aiohttp for asyncio-compatible non-blocking operation.
@@ -337,7 +335,7 @@ As an integration developer, I want the simulator to provide detailed logging of
 
 - **FR-040**: Simulator MUST load initial configuration from a file (JSON format)
 - **FR-041**: Configuration file MUST support defining: network settings (IP, port, mDNS name), HTTP API port, initial device list, default protocol behaviors
-- **FR-042**: Configuration file MUST support defining test scenarios as complete, self-contained JSON objects that include all devices, states, enabled quirks, timing configurations, and expected behaviors; scenarios can be activated by name via control interface (HTTP POST /scenario/activate endpoint) for reproducible testing
+- **FR-042**: Configuration file MUST support defining test scenarios as complete, self-contained JSON objects that include all devices, states, enabled quirks, timing configurations, and expected behaviors; scenarios can be activated by name via control interface (HTTP POST /scenario/activate endpoint) for reproducible testing; scenario activation atomically replaces the entire device configuration with the scenario's device definitions while keeping client connections active, enabling tests of dynamic device topology changes
 - **FR-043**: Simulator MUST validate all scenario data on load with explicit validation rules: required fields presence, UUID format correctness, value range compliance (dim: 0-100, valid device types, valid capability strings); invalid scenarios MUST be rejected with descriptive error messages indicating exact field paths and validation failures (e.g., "scenarios[2].devices[5].dim: value 150 exceeds maximum 100")
 - **FR-044**: Simulator MUST support default configuration values allowing zero-configuration startup for basic testing
 - **FR-067**: Simulator MUST support configuration precedence chain: CLI arguments > environment variables > config file > built-in defaults; command-line flags (--port, --bind-ip, --log-level, --config, --api-port) override environment variables (DEAKO_SIM_PORT, DEAKO_SIM_BIND_IP, DEAKO_SIM_LOG_LEVEL, DEAKO_SIM_CONFIG, DEAKO_SIM_API_PORT) which override config file values
@@ -347,7 +345,7 @@ As an integration developer, I want the simulator to provide detailed logging of
 
 #### Logging and Observability
 
-- **FR-045**: Simulator MUST log all events to a single unified log file with: timestamp, severity level (DEBUG/INFO/WARNING/ERROR), component tag (telnet/http/simulator/connection), client identifier (where applicable), and event details; implemented using Python's standard logging module with configurable handlers (console, file) and formatters (text, optional JSON structured format)
+- **FR-045**: Simulator MUST log all events to a single unified log file with: timestamp, severity level (DEBUG/INFO/WARNING/ERROR), component tag (telnet/http/simulator/connection), client identifier (where applicable), and event details; implemented using Python's standard logging module with configurable handlers (console, file) and formatters
 - **FR-046**: Simulator MUST log all received telnet messages with: timestamp, client identifier, full message content, component tag "telnet.recv"
 - **FR-047**: Simulator MUST log all sent telnet messages with: timestamp, client identifier, full message content, component tag "telnet.send"
 - **FR-048**: Simulator MUST log connection events: client connections, disconnections, errors with client IP, timestamps, and component tag "connection"
@@ -360,7 +358,7 @@ As an integration developer, I want the simulator to provide detailed logging of
 #### Error Handling
 
 - **FR-054**: Simulator MUST handle port binding failures gracefully and report clear error messages
-- **FR-055**: Simulator MUST handle mDNS registration failures based on configuration: in default mode, log WARNING with specific failure reason (port conflict, permissions, network unavailable) and actionable guidance (e.g., "mDNS registration failed: port 5353 in use. Connect directly to <IP>:<port>"), then continue startup with telnet/HTTP services fully functional; in strict mode (--require-mdns flag), treat mDNS registration as mandatory and fail startup with clear error message
+- **FR-055**: Simulator MUST handle mDNS registration failures based on configuration: in default mode, log WARNING with specific failure reason (port conflict, permissions, network unavailable) and actionable guidance, then continue startup with telnet/HTTP services fully functional; in strict mode (--require-mdns flag), treat mDNS registration as mandatory and fail startup with clear error message
 - **FR-056**: Simulator MUST handle malformed JSON commands without crashing
 - **FR-057**: Simulator MUST handle unexpected client disconnections without affecting other connected clients
 - **FR-058**: Simulator MUST continue operating if log file writing fails (fall back to console-only logging)
@@ -617,7 +615,7 @@ All functional requirements above have been validated through systematic hardwar
 9. **[Connection Lifecycle (No timeout, immediate reconnect)](./research/connection-lifecycle-test-2025-10-18.md)** - FR-084 through FR-087  
    Test: [`tests/test-connection-lifecycle.ps1`](./tests/test-connection-lifecycle.ps1)
 
-10. **[Performance Limits (Silent degradation, response timing)](./research/performance-limits-test-2025-10-20.md)** - FR-088 through FR-091  
+10. **[Performance Limits (Silent degradation, response timing)](./research/performance-limits-test-2025-10-20.md)** - NOTE: Originally documented FR-088 through FR-091 but removed from spec per user feedback; behavior observed may have been temporary hub overload rather than designed protection mechanism  
    Test: [`tests/test-performance-limits.ps1`](./tests/test-performance-limits.ps1)
 
 ### Testing Statistics
