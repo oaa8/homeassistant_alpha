@@ -1,29 +1,39 @@
 <!--
-  Sync Impact Report - Constitution v1.1.1
+  Sync Impact Report - Constitution v1.3.0
   
-  Version Change: 1.1.0 → 1.1.1 (Patch - clarifications and expanded guidance)
+  Version Change: 1.2.1 → 1.3.0 (Minor - new development standard section added)
   
-  Changes in v1.1.1:
-  - EXPANDED: "Content Organization Principles" to include comprehensive timestamp
-    requirements for all recorded information, not just research files
-  - CLARIFIED: Timestamp formats and placement requirements
-  - ADDED: Examples of timestamp usage across different artifact types
+  Changes in v1.3.0:
+  - ADDED: "Code Documentation Standards" section in Development Standards with:
+    - Mandatory file header format (author: GitHub Copilot, creation date, purpose, assumptions)
+    - Inline comment requirements (document WHY: assumptions, motives, intent, expectations, constraints)
+    - Function/method docstring requirements (purpose, parameter rationale, return reasoning)
+    - Examples for each comment type (assumptions, quirks, complexity rationale, etc.)
+    - Explicit "what NOT to comment" guidance
+  - UPDATED: Principle V "Long-Term Readability" to reference Code Documentation Standards
+    and require file headers with date/author
   
-  Previous Principles (Unchanged):
+  Previous Changes (v1.2.1):
+  - "Tests Written for Debugging" requirement added to Principle VII
+  - Fixed contradiction between Technology Constraints and Principle VII
+  - Clarified hardware validation gate exempts trivial protocol elements
+  - Strengthened TODO tracking (immediate, no delayed tracking)
+  - Made compliance event-triggered instead of vague audits
+  
+  Core Principles (Unchanged):
   - I. Hardware Fidelity First
   - II. Simplicity Over Cleverness  
   - III. End-User Validation Required (NON-NEGOTIABLE)
   - IV. Test Facility, Not Product
-  - V. Long-Term Readability
+  - V. Long-Term Readability (EXPANDED with documentation requirements)
   - VI. No Orphaned Work (NON-NEGOTIABLE)
+  - VII. Comprehensive Testing Required (NON-NEGOTIABLE)
   
   Templates Requiring Review:
-  ✅ plan-template.md - Reviewed, no changes needed
-  ✅ spec-template.md - Reviewed, no changes needed
-  ✅ tasks-template.md - Reviewed, no changes needed
+  ✅ No template changes needed - development standards are implementation guidance
   
   Follow-up TODOs:
-  - None - all placeholders resolved
+  - None
 -->
 
 # Deako Home Assistant Integration Constitution
@@ -95,11 +105,15 @@
 
 - Functions do one thing with obvious names describing exactly what they do
 - Comments explain WHY (rationale, quirks, hardware validation context), not WHAT (code explains what)
+  - Document assumptions, motives, intent, expectations, and constraints WHILE writing
+  - Explain WHY code is written a particular way to maximize maintainability
+  - See "Code Documentation Standards" in Development Standards for detailed requirements
 - Magic numbers MUST be named constants with comments explaining their source (e.g., "100ms minimum validated via hardware test 2025-10-18")
 - Protocol quirks MUST have comments referencing the research document that discovered them
 - Variable names are complete words, not abbreviations (device_uuid not dev_id)
 - File organization follows obvious structure: models/, services/, api/ not clever architectural abstractions
 - No "clever" code—explicit and verbose beats terse and implicit
+- Every source file MUST have a header comment with creation date and author
 
 **Rationale**: Future maintainers (including future you) will approach this cold, with context forgotten. They need to understand what the code does, why it does it that way, and what real-world behavior it's replicating. Readability is the only feature that compounds over time.
 
@@ -132,6 +146,67 @@
 
 ---
 
+### VII. Comprehensive Testing Required (NON-NEGOTIABLE)
+
+**Tests MUST achieve 95%+ coverage validating functionality across all layers, not just executing lines.**
+
+- **Coverage Target**: 95%+ of lines MUST be validated against end-user requirements, not just executed
+  - Each line's purpose for end users MUST be tested in every scenario where that line executes
+  - All branches, conditions, and code paths MUST be tested with realistic scenarios
+  - Coverage below 80% indicates architectural problems requiring redesign
+- **Multi-Layer Validation (Component Interaction Testing)**: Tests MUST validate how components work together, not just isolated units
+  - **Protocol + Logic**: Message parsing triggers correct state changes
+  - **Component Interactions**: Commands affect state AND subsequent queries reflect those changes
+  - **End-to-End Flows**: Full request/response cycles work as expected
+  - **Contract Compatibility**: External integrations receive expected formats
+  - **The goal**: Catch integration bugs where individual components work in isolation but fail when connected
+  - **Example**: Testing dim command requires valid JSON accepted AND device state changes, dim command affects state AND subsequent polls reflect the change, Home Assistant sends command AND receives expected response format (not sufficient: testing JSON parser alone without state effects)
+- **Deterministic Design**: Tests MUST be reliable and reproducible
+  - **No flaky tests**: Tests pass reliably or are removed/fixed immediately
+  - **No sleep/wait patterns**: Use event-driven synchronization, dependency injection, or deterministic time control
+  - **Reproducible failures**: Same input always produces same output
+  - **Injectable dependencies**: External systems (time, random, network) can be controlled in tests
+  - **Isolated test state**: No test depends on execution order or previous test state
+  - Code that cannot be tested deterministically MUST be redesigned
+  - **Focus on design, not run counts**: The goal is tests that are inherently reliable by design, not tests that need to be run repeatedly to prove stability
+- **Architecture for Testability**: Code architecture MUST enable high test coverage
+  - Dependencies MUST be injectable to enable isolation and mocking
+  - Side effects MUST be contained and testable (I/O, network, time, random)
+  - Complex functions MUST be decomposed into testable units
+  - If code cannot reach 95% coverage with legitimate tests, refactor it until it can
+- **Legitimate Tests Only**: No fake tests just to hit coverage numbers
+  - Each test MUST validate actual functionality against requirements
+  - Tests MUST fail when behavior is broken, pass when behavior is correct
+  - Assertions MUST verify observable outcomes, not implementation details
+  - Tests MUST represent real usage scenarios from end-user perspective
+- **Tests Written for Debugging**: Tests MUST empower whoever hits a failure to understand and fix it quickly
+  - **Document the "why"**: Each test MUST include a docstring/comment explaining:
+    - What end-user scenario this validates (trace back to requirements/user story)
+    - Why this expectation exists (the rationale, not just "it should work")
+    - What assumptions are being made (about state, environment, timing, etc.)
+  - **Make failures informative**: Assertion messages MUST state expected vs actual AND what it means for the end user
+    - ❌ Bad: `assert dim_value == 50`
+    - ✅ Good: `assert dim_value == 50, f"Dim command should update device state to 50% but got {dim_value}% - integration won't see state change"`
+  - **Enable informed refactoring**: Someone refactoring should be able to:
+    - Understand what end-user scenario would break if test fails
+    - Evaluate whether the original expectation is still valid for current requirements
+    - Update test appropriately if requirements legitimately changed
+    - Know what to check/validate if they need to modify the behavior
+  - **Link to requirements**: Tests MUST reference the spec/requirement they validate (in docstring or test name)
+    - Example: `test_dim_command_updates_state_FR023()` or `# Validates FR-023: Dim commands update device state`
+- **Coverage Exceptions Require Justification**:
+  - Any code below 95% coverage MUST have documented rationale
+  - Below 80% coverage REQUIRES architectural redesign—percentage too low
+  - Exceptions logged in `specs/[feature]/test-coverage-exceptions.md` with:
+    - Exact code location and current coverage percentage
+    - Technical reason why higher coverage isn't achievable
+    - Alternative validation strategy employed
+    - Date of decision and reviewer approval
+
+**Rationale**: The simulator's correctness is non-negotiable—incorrect behavior destroys trust and wastes integration developer time. Comprehensive, deterministic tests are the only way to prove correctness and prevent regressions. Low coverage or flaky tests indicate architectural problems that must be fixed, not accepted. Testing is not optional; it's how we know the simulator works.
+
+---
+
 ## Technology Constraints
 
 **These constraints prevent technology proliferation and ensure long-term maintainability:**
@@ -142,7 +217,7 @@
 - **Configuration**: JSON only (no YAML, no TOML—one format, universally supported)
 - **Distribution**: pip-installable package with pyproject.toml (standard Python packaging)
 - **Logging**: Python standard library logging module (no third-party logging frameworks)
-- **Testing**: Validation against real integration code (not unit tests of simulator internals)
+- **Testing Philosophy**: End goal is validating integration behavior, but achieving this requires comprehensive testing of simulator internals with 95%+ coverage (see Principle VII)
 
 **New dependencies require explicit justification**: What problem does this solve? Why can't standard library or existing dependencies handle it? What's the maintenance cost?
 
@@ -152,12 +227,14 @@
 
 ### Hardware Validation Gate
 
-Before implementing any protocol behavior:
+Before implementing protocol behavior that affects device interaction or state management:
 
 1. Behavior MUST be validated against real Deako hub hardware OR
 2. Marked "PENDING HARDWARE VALIDATION" with explicit validation test script defined
 3. Research findings documented in `specs/[feature]/research/[test-name]-YYYY-MM-DD.md`
 4. Test scripts placed in `specs/[feature]/tests/test-[name].ps1`
+
+**Note**: Trivial protocol elements (basic HTTP status codes, standard JSON structure) don't require hardware validation unless they affect device behavior.
 
 ### Completion Definition
 
@@ -182,6 +259,151 @@ A task is complete when:
 - Every error message MUST include: what failed, why it matters, how to fix it
 - User errors (bad config, invalid commands) ≠ bugs—guide users, don't crash
 
+### Code Documentation Standards
+
+**All code MUST document the WHY, not the WHAT. The code itself explains what it does; comments explain why it exists and why it's written that way.**
+
+#### File Header Requirements
+
+Every source file MUST begin with a header comment containing:
+
+```python
+"""
+Module: [brief description of module purpose]
+Author: GitHub Copilot
+Created: YYYY-MM-DD
+Last Modified: YYYY-MM-DD
+
+Purpose:
+[2-3 sentences explaining what problem this module solves and why it exists]
+
+Key Assumptions:
+- [Assumption 1 about environment, hardware, protocol, etc.]
+- [Assumption 2]
+
+Related Research:
+- [Link to relevant research docs if applicable]
+"""
+```
+
+**Example**:
+```python
+"""
+Module: Device state management for Deako hub simulator
+Author: GitHub Copilot
+Created: 2025-10-25
+Last Modified: 2025-10-25
+
+Purpose:
+Maintains in-memory device state that matches real Deako hub behavior.
+Handles state transitions, validation, and persistence for integration testing.
+
+Key Assumptions:
+- Device state persists only in memory (no disk writes required for test facility)
+- State changes are synchronous (matches observed hardware behavior)
+- UUID format is validated but not cryptographically verified
+
+Related Research:
+- specs/001-deako-hub-simulator/research/device-state-test-2025-10-18.md
+"""
+```
+
+#### Inline Comment Requirements
+
+Comments MUST document:
+
+1. **Assumptions**: What preconditions, environmental factors, or protocol behaviors are assumed
+   ```python
+   # ASSUMPTION: Hub accepts dim values 0-100 even though spec says 1-99
+   # Validated 2025-10-18 via hardware test - see research/dim-validation-test-2025-10-18.md
+   if not 0 <= dim_value <= 100:
+       raise ValueError(f"Dim value {dim_value} outside valid range 0-100")
+   ```
+
+2. **Motives/Intent**: Why this approach was chosen over alternatives
+   ```python
+   # Using dict instead of dataclass because we need dynamic attribute access
+   # for generic message handling (hardware sends varying field sets)
+   device_state = {}
+   ```
+
+3. **Expectations**: What behavior is expected and why
+   ```python
+   # EXPECT: Connection closes after 60s idle (hardware behavior)
+   # Integration must implement keepalive or reconnect logic
+   IDLE_TIMEOUT = 60
+   ```
+
+4. **Constraints**: Limitations, edge cases, or boundaries
+   ```python
+   # CONSTRAINT: Maximum 100 concurrent connections (hardware limit)
+   # Exceeding this will cause oldest connection to be dropped
+   MAX_CONNECTIONS = 100
+   ```
+
+5. **Hardware Quirks**: Behavior that matches real devices but seems odd
+   ```python
+   # QUIRK: Hub returns success but ignores dim commands to devices in "off" state
+   # This is validated hardware behavior, not a bug - see research/physical-button-behavior-test-2025-10-18.md
+   if device_state["power"] == "off":
+       return {"status": "success"}  # Accepted but ignored
+   ```
+
+6. **Rationale for Complexity**: When violating "Simplicity Over Cleverness"
+   ```python
+   # RATIONALE: Using connection pool instead of simple socket because:
+   # - Hardware exhibits rate limiting that requires connection reuse (validated 2025-10-17)
+   # - Creating new connections for each request triggers backoff (50+ req/sec)
+   # - Simpler approach (new connection per request) doesn't match hardware behavior
+   # See: specs/001-deako-hub-simulator/research/rate-limiting-systematic-test-2025-10-18.md
+   ```
+
+#### What NOT to Comment
+
+- ❌ **Obvious code**: `i += 1  # Increment i` (code is self-explanatory)
+- ❌ **Restating code**: `get_device()  # Gets the device` (adds no information)
+- ❌ **TODO without tracking**: Use proper TODO(T###) format with task reference
+- ❌ **Outdated comments**: Update or delete when code changes
+
+#### Function/Method Documentation
+
+Every non-trivial function MUST have a docstring explaining:
+- **Purpose**: What problem it solves (not what it does line-by-line)
+- **Parameters**: WHY each parameter exists, any constraints/assumptions
+- **Returns**: What it returns and WHY that format/structure
+- **Raises**: Expected exceptions and WHEN they occur (the triggering condition)
+
+```python
+def validate_dim_command(device_uuid: str, dim_value: int) -> bool:
+    """
+    Validates dim command matches real Deako hub behavior.
+    
+    Purpose:
+    Hardware accepts dim values 0-100 (not 1-99 per spec) and silently
+    clamps out-of-range values. This validator replicates that behavior
+    so integration developers see the same responses during testing.
+    
+    Parameters:
+    - device_uuid: Device identifier. MUST be valid UUID format because
+      hardware rejects malformed UUIDs with specific error code.
+    - dim_value: Target brightness 0-100. Hardware accepts this range
+      despite spec claiming 1-99 (validated 2025-10-18).
+    
+    Returns:
+    True if command is valid. False triggers error response to match
+    hardware behavior when device doesn't exist.
+    
+    Raises:
+    ValueError: If UUID format invalid (matches hardware error behavior)
+    
+    Related Research:
+    - specs/001-deako-hub-simulator/research/dim-validation-test-2025-10-18.md
+    """
+    # Implementation...
+```
+
+**Rationale**: Code without context is archaeological work. Comments documenting assumptions, motives, and constraints enable future maintainers (including future you) to understand not just WHAT the code does, but WHY it exists and why it's written that way. This is essential for informed refactoring, debugging, and evolution.
+
 ### Work Tracking and Organization
 
 **Preventing forgotten work and maintaining discoverability:**
@@ -203,7 +425,11 @@ Every TODO/FIXME/HACK/PLACEHOLDER/STUB in code or documentation requires:
    # Research: specs/001-deako-hub-simulator/research/rate-limiting-systematic-test-2025-10-18.md
    ```
 
-3. **Regular audit**: Before marking any phase complete, search codebase for TODO/FIXME/HACK/PLACEHOLDER and verify all are tracked
+3. **Immediate tracking required**: As soon as you write a TODO/placeholder, you MUST immediately add it to tasks.md
+   - **Rationale**: AI agents have limited context windows and will forget to go back to untracked items
+   - **No exceptions**: Don't rely on "I'll track it later" - track it NOW or it will be forgotten
+
+4. **Regular audit**: Before marking any feature complete, search codebase for TODO/FIXME/HACK/PLACEHOLDER and verify all are tracked
 
 #### File Organization Rules
 
@@ -238,7 +464,7 @@ Every TODO/FIXME/HACK/PLACEHOLDER/STUB in code or documentation requires:
 
 #### Content Organization Principles
 
-- **Chunk by topic**: Break large documents into focused files (max ~500 lines)
+- **Chunk by topic**: Break large documents into focused files at natural boundaries (typically around 500 lines when navigation becomes difficult)
 - **Clear navigation**: Use table of contents, section links, explicit file references
 - **Single source of truth**: Don't duplicate—reference and link
 - **Descriptive naming**: File names MUST indicate content and purpose
@@ -324,11 +550,13 @@ When violating "Simplicity Over Cleverness":
 
 ### Compliance
 
-- All code reviews MUST verify constitution compliance
+- Before committing code, MUST self-audit for constitution compliance
 - Implementation plans MUST include "Constitution Check" section
 - Violations found during development MUST be either fixed or explicitly justified with evidence
-- Before marking any work phase complete, MUST audit for orphaned TODOs and untracked placeholders
-- Regular audits of `temp/` and `to-delete/` directories to ensure timely cleanup
+- Before marking any feature complete, MUST audit for orphaned TODOs and untracked placeholders
+- Before closing a feature branch, MUST clean up temp/ and to-delete/ artifacts
 - All new artifacts MUST include appropriate timestamps per "Timestamp Requirements" section
+- Test coverage MUST meet 95% target; any exceptions below 95% require documented justification in `specs/[feature]/test-coverage-exceptions.md`
+- Tests MUST be deterministic by design (no flaky tests tolerated)
 
-**Version**: 1.1.1 | **Ratified**: 2025-10-25 | **Last Amended**: 2025-10-25
+**Version**: 1.3.0 | **Ratified**: 2025-10-25 | **Last Amended**: 2025-10-25
