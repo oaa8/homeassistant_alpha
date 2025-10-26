@@ -1,17 +1,21 @@
 <!--
-  Sync Impact Report - Constitution v1.3.0
+  Sync Impact Report - Constitution v1.4.0
   
-  Version Change: 1.2.1 → 1.3.0 (Minor - new development standard section added)
+  Version Change: 1.3.0 → 1.4.0 (Minor - new core principle added)
   
-  Changes in v1.3.0:
-  - ADDED: "Code Documentation Standards" section in Development Standards with:
-    - Mandatory file header format (author: GitHub Copilot, creation date, purpose, assumptions)
-    - Inline comment requirements (document WHY: assumptions, motives, intent, expectations, constraints)
-    - Function/method docstring requirements (purpose, parameter rationale, return reasoning)
-    - Examples for each comment type (assumptions, quirks, complexity rationale, etc.)
-    - Explicit "what NOT to comment" guidance
-  - UPDATED: Principle V "Long-Term Readability" to reference Code Documentation Standards
-    and require file headers with date/author
+  Changes in v1.4.0:
+  - ADDED: Principle VIII "Explicit Error Handling Required (NON-NEGOTIABLE)"
+    - Prohibits catch-all exception handlers that swallow errors
+    - Requires catching only specific expected exceptions
+    - Mandates fail-fast behavior for unexpected errors
+    - Requires clear error states instead of silent degradation
+    - Requires documentation of expected vs unexpected exceptions
+    - Rationale: Maintainability, predictability, debuggability
+  - UPDATED: "Error Handling Philosophy" section in Development Standards to reference Principle VIII
+  
+  Previous Changes (v1.3.0):
+  - "Code Documentation Standards" section added with mandatory file headers and WHY-focused comments
+  - Principle V "Long-Term Readability" expanded with documentation requirements
   
   Previous Changes (v1.2.1):
   - "Tests Written for Debugging" requirement added to Principle VII
@@ -20,20 +24,23 @@
   - Strengthened TODO tracking (immediate, no delayed tracking)
   - Made compliance event-triggered instead of vague audits
   
-  Core Principles (Unchanged):
+  Core Principles:
   - I. Hardware Fidelity First
   - II. Simplicity Over Cleverness  
   - III. End-User Validation Required (NON-NEGOTIABLE)
   - IV. Test Facility, Not Product
-  - V. Long-Term Readability (EXPANDED with documentation requirements)
+  - V. Long-Term Readability
   - VI. No Orphaned Work (NON-NEGOTIABLE)
   - VII. Comprehensive Testing Required (NON-NEGOTIABLE)
+  - VIII. Explicit Error Handling Required (NON-NEGOTIABLE) ← NEW
   
   Templates Requiring Review:
-  ✅ No template changes needed - development standards are implementation guidance
+  ⚠ plan-template.md - Consider adding error handling to Constitution Check
+  ⚠ spec-template.md - Consider adding error scenarios to requirements
+  ⚠ tasks-template.md - Consider adding error handling validation tasks
   
   Follow-up TODOs:
-  - None
+  - Review templates to determine if error handling guidance should be explicit
 -->
 
 # Deako Home Assistant Integration Constitution
@@ -207,6 +214,87 @@
 
 ---
 
+### VIII. Explicit Error Handling Required (NON-NEGOTIABLE)
+
+**The system MUST fail predictably. Catch-all exception handlers that swallow errors are prohibited.**
+
+- **Catch specific expected exceptions only**: Each try/except block MUST catch only the specific exception types that are expected and recoverable in that context
+- **Document expected exceptions**: Every try/except block MUST have a comment explaining:
+  - What specific error condition is expected (e.g., "Network timeout during device discovery")
+  - Why it's expected and recoverable (e.g., "Device may be powered off, retry later")
+  - What recovery action is taken (e.g., "Log warning, continue with other devices")
+- **No bare except or Exception handlers**: Patterns like `except:` or `except Exception:` are FORBIDDEN unless:
+  - Immediately followed by re-raising with additional context
+  - Used at application boundary (e.g., top-level error handler) with explicit logging and graceful shutdown
+  - Explicitly justified in code comment with specific rationale
+- **Fail fast for unexpected errors**: When an exception is not expected and recoverable, let it propagate—do not catch and ignore
+  - Unexpected errors indicate bugs or invalid assumptions that MUST be fixed, not hidden
+  - Silent failures make debugging exponentially harder and create data corruption risks
+  - The system crashing with a clear stack trace is better than continuing in undefined state
+- **Clear error states over degradation**: When an error prevents normal operation:
+  - System MUST enter a clear, observable error state (e.g., connection state = "failed", device status = "unavailable")
+  - Error state MUST be logged with full context (what failed, why it matters, how to fix)
+  - User-facing operations MUST return explicit error responses, not partial success or silent failures
+  - No "best effort" fallbacks that hide that something went wrong
+- **Test error paths explicitly**: Every exception handler MUST have a corresponding test that:
+  - Triggers the specific error condition
+  - Validates the recovery behavior or error state
+  - Confirms error is logged with sufficient context for debugging
+  - See Principle VII for test coverage requirements
+- **Rationale in code**: When catching broad exception types is unavoidable:
+  - Comment MUST explain why specific exception catching isn't possible
+  - Comment MUST list the specific error scenarios being handled
+  - Consider whether this indicates an architectural problem requiring redesign
+
+**Examples**:
+
+```python
+# ❌ FORBIDDEN: Swallows all errors silently
+try:
+    result = risky_operation()
+except:
+    pass  # Violates principle - what errors? why ignore them?
+
+# ❌ FORBIDDEN: Catches everything without context
+try:
+    result = risky_operation()
+except Exception as e:
+    logger.error(f"Error: {e}")  # Loses stack trace, no recovery, continues anyway
+    result = None
+
+# ✅ GOOD: Catches specific expected error with documented recovery
+try:
+    device_state = await hub.query_device(uuid)
+except DeviceNotFoundError:
+    # EXPECTED: Device may be powered off or disconnected during discovery
+    # RECOVERY: Mark device as unavailable and retry in next poll cycle
+    logger.warning(f"Device {uuid} not responding, marking unavailable")
+    device_state = DeviceState(uuid=uuid, status="unavailable")
+except NetworkTimeoutError:
+    # EXPECTED: Network interruption during query (hub may be restarting)
+    # RECOVERY: Re-raise to trigger connection recovery at higher level
+    logger.error(f"Network timeout querying device {uuid}, connection lost")
+    raise ConnectionLostError(f"Hub connection timeout during device query") from None
+
+# ✅ ACCEPTABLE: Catch-all at application boundary with explicit handling
+def main():
+    try:
+        run_simulator()
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by user")
+        cleanup_resources()
+    except Exception as e:
+        # APPLICATION BOUNDARY: Last-resort handler for unexpected errors
+        # Logs full context and performs graceful shutdown
+        logger.critical(f"Unexpected error: {e}", exc_info=True)
+        cleanup_resources()
+        sys.exit(1)  # Explicit failure, not silent continue
+```
+
+**Rationale**: Silent failures and swallowed exceptions are the root cause of the hardest-to-debug problems. When errors are caught and ignored, the system continues in an undefined state where assumptions are violated and subsequent behavior is unpredictable. This creates cascading failures, data corruption, and debugging sessions that waste hours chasing symptoms instead of root causes. Explicit error handling makes the system maintainable and predictable. A crash with a clear stack trace is a gift—it tells you exactly what broke and where. Catching that crash and continuing with corrupted state is technical debt that compounds exponentially.
+
+---
+
 ## Technology Constraints
 
 **These constraints prevent technology proliferation and ensure long-term maintainability:**
@@ -254,10 +342,15 @@ A task is complete when:
 
 ### Error Handling Philosophy
 
+**See Principle VIII "Explicit Error Handling Required" for core requirements.**
+
+Additional implementation guidance:
+
 - Fail fast with clear error messages over silent degradation
 - Log enough context to diagnose issues without reproducing them
 - Every error message MUST include: what failed, why it matters, how to fix it
 - User errors (bad config, invalid commands) ≠ bugs—guide users, don't crash
+- Distinguish expected recoverable errors from unexpected bugs (see Principle VIII examples)
 
 ### Code Documentation Standards
 
@@ -558,5 +651,6 @@ When violating "Simplicity Over Cleverness":
 - All new artifacts MUST include appropriate timestamps per "Timestamp Requirements" section
 - Test coverage MUST meet 95% target; any exceptions below 95% require documented justification in `specs/[feature]/test-coverage-exceptions.md`
 - Tests MUST be deterministic by design (no flaky tests tolerated)
+- Error handling MUST comply with Principle VIII (no catch-all exception handlers without justification)
 
-**Version**: 1.3.0 | **Ratified**: 2025-10-25 | **Last Amended**: 2025-10-25
+**Version**: 1.4.0 | **Ratified**: 2025-10-25 | **Last Amended**: 2025-10-25

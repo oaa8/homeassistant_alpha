@@ -1,0 +1,316 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/oaa8/homeassistant_alpha/deako-simulator/messages.schema.json",
+  "title": "Deako Protocol Messages",
+  "description": "JSON Schema for Deako hub telnet protocol messages",
+  "oneOf": [
+    {"$ref": "#/definitions/deviceListRequest"},
+    {"$ref": "#/definitions/deviceListResponse"},
+    {"$ref": "#/definitions/deviceFound"},
+    {"$ref": "#/definitions/controlRequest"},
+    {"$ref": "#/definitions/controlResponse"},
+    {"$ref": "#/definitions/event"},
+    {"$ref": "#/definitions/pingRequest"},
+    {"$ref": "#/definitions/pingResponse"},
+    {"$ref": "#/definitions/devicePollRequest"},
+    {"$ref": "#/definitions/devicePollResponse"}
+  ],
+  "definitions": {
+    "deviceListRequest": {
+      "type": "object",
+      "description": "Client requests total device count",
+      "required": ["name", "transactionId"],
+      "properties": {
+        "name": {"const": "DEVICE_LIST"},
+        "transactionId": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "deviceListResponse": {
+      "type": "object",
+      "description": "Hub responds with device count, followed by DEVICE_FOUND stream",
+      "required": ["name", "transactionId", "status", "data", "timestamp"],
+      "properties": {
+        "name": {"const": "DEVICE_LIST"},
+        "transactionId": {"type": "string"},
+        "status": {"const": "ok"},
+        "data": {
+          "type": "object",
+          "required": ["deviceCount"],
+          "properties": {
+            "deviceCount": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Total number of devices"
+            }
+          },
+          "additionalProperties": false
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Unix timestamp in milliseconds"
+        }
+      },
+      "additionalProperties": false
+    },
+    "deviceFound": {
+      "type": "object",
+      "description": "Hub announces device (unsolicited, sent after DEVICE_LIST response)",
+      "required": ["name", "data", "timestamp"],
+      "properties": {
+        "name": {"const": "DEVICE_FOUND"},
+        "data": {
+          "type": "object",
+          "required": ["uuid", "name"],
+          "properties": {
+            "uuid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "name": {"type": "string"},
+            "power": {
+              "type": ["boolean", "null"],
+              "description": "Current power state (null if unknown)"
+            },
+            "dim": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Current dim level (null if not dimmable or unknown)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "timestamp": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "controlRequest": {
+      "type": "object",
+      "description": "Client requests device state change",
+      "required": ["name", "transactionId", "data"],
+      "properties": {
+        "name": {"const": "CONTROL"},
+        "transactionId": {"type": "string"},
+        "data": {
+          "type": "object",
+          "required": ["uuid"],
+          "properties": {
+            "uuid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "power": {
+              "type": "boolean",
+              "description": "Desired power state"
+            },
+            "dim": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Desired dim level (only for dimmable devices)"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "controlResponse": {
+      "type": "object",
+      "description": "Hub acknowledges control request (immediate ~100ms response)",
+      "required": ["name", "transactionId", "status", "timestamp"],
+      "properties": {
+        "name": {"const": "CONTROL"},
+        "transactionId": {"type": "string"},
+        "status": {
+          "enum": ["ok", "error"],
+          "description": "ok if accepted, error if rejected"
+        },
+        "error": {
+          "type": "string",
+          "description": "Error description (only when status=error)"
+        },
+        "timestamp": {"type": "integer"}
+      },
+      "additionalProperties": false,
+      "if": {
+        "properties": {"status": {"const": "error"}}
+      },
+      "then": {
+        "required": ["error"]
+      }
+    },
+    "event": {
+      "type": "object",
+      "description": "Hub broadcasts device state change (unsolicited, sent to all connections)",
+      "required": ["name", "data", "timestamp"],
+      "properties": {
+        "name": {"const": "EVENT"},
+        "data": {
+          "type": "object",
+          "required": ["uuid", "name", "eventType"],
+          "properties": {
+            "uuid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "name": {"type": "string"},
+            "power": {
+              "type": ["boolean", "null"],
+              "description": "New power state"
+            },
+            "dim": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 100,
+              "description": "New dim level (null if not dimmable)"
+            },
+            "eventType": {
+              "type": "string",
+              "enum": ["DEVICE_STATE_CHANGE", "DEVICE_ADDED", "DEVICE_REMOVED"],
+              "description": "Event type identifier"
+            }
+          },
+          "additionalProperties": false
+        },
+        "timestamp": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "pingRequest": {
+      "type": "object",
+      "description": "Client health check request",
+      "required": ["name", "transactionId"],
+      "properties": {
+        "name": {"const": "PING"},
+        "transactionId": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "pingResponse": {
+      "type": "object",
+      "description": "Hub echoes ping with timestamp",
+      "required": ["name", "transactionId", "status", "timestamp"],
+      "properties": {
+        "name": {"const": "PING"},
+        "transactionId": {"type": "string"},
+        "status": {"const": "ok"},
+        "timestamp": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "devicePollRequest": {
+      "type": "object",
+      "description": "Client requests specific device state",
+      "required": ["name", "transactionId", "data"],
+      "properties": {
+        "name": {"const": "DEVICE_POLL"},
+        "transactionId": {"type": "string"},
+        "data": {
+          "type": "object",
+          "required": ["uuid"],
+          "properties": {
+            "uuid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "devicePollResponse": {
+      "type": "object",
+      "description": "Hub returns device state (FR-023: always returns status=error even on success)",
+      "required": ["name", "transactionId", "status", "data", "timestamp"],
+      "properties": {
+        "name": {"const": "DEVICE_POLL"},
+        "transactionId": {"type": "string"},
+        "status": {
+          "const": "error",
+          "description": "QUIRK: Real hub always returns 'error' even on success (FR-023)"
+        },
+        "data": {
+          "type": "object",
+          "required": ["uuid", "name"],
+          "properties": {
+            "uuid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "name": {"type": "string"},
+            "power": {
+              "type": ["boolean", "null"],
+              "description": "Current power state"
+            },
+            "dim": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Current dim level (null if not dimmable)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "timestamp": {"type": "integer"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "examples": [
+    {
+      "description": "DEVICE_LIST request",
+      "value": {
+        "name": "DEVICE_LIST",
+        "transactionId": "req-001"
+      }
+    },
+    {
+      "description": "DEVICE_LIST response",
+      "value": {
+        "name": "DEVICE_LIST",
+        "transactionId": "req-001",
+        "status": "ok",
+        "data": {"deviceCount": 37},
+        "timestamp": 1729881234567
+      }
+    },
+    {
+      "description": "CONTROL request (power on, dim to 75%)",
+      "value": {
+        "name": "CONTROL",
+        "transactionId": "ctrl-001",
+        "data": {
+          "uuid": "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789",
+          "power": true,
+          "dim": 75
+        }
+      }
+    },
+    {
+      "description": "CONTROL acknowledgment",
+      "value": {
+        "name": "CONTROL",
+        "transactionId": "ctrl-001",
+        "status": "ok",
+        "timestamp": 1729881234567
+      }
+    },
+    {
+      "description": "EVENT (device state change)",
+      "value": {
+        "name": "EVENT",
+        "data": {
+          "uuid": "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789",
+          "name": "Kitchen Overhead",
+          "power": true,
+          "dim": 75,
+          "eventType": "DEVICE_STATE_CHANGE"
+        },
+        "timestamp": 1729881236567
+      }
+    }
+  ]
+}

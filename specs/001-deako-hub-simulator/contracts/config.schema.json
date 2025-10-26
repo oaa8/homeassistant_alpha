@@ -1,0 +1,207 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/oaa8/homeassistant_alpha/deako-simulator/config.schema.json",
+  "title": "Deako Simulator Configuration",
+  "description": "Configuration file schema for Deako Hub Simulator",
+  "type": "object",
+  "required": ["devices"],
+  "properties": {
+    "devices": {
+      "type": "array",
+      "description": "Array of devices to simulate",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/device"
+      }
+    },
+    "network": {
+      "type": "object",
+      "description": "Network configuration settings",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Bind address for telnet server",
+          "default": "0.0.0.0",
+          "examples": ["0.0.0.0", "127.0.0.1"]
+        },
+        "port": {
+          "type": "integer",
+          "description": "Telnet port number",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 23
+        },
+        "http_port": {
+          "type": "integer",
+          "description": "HTTP API port number",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8080
+        },
+        "mdns_name": {
+          "type": "string",
+          "description": "mDNS service name",
+          "default": "local-integration",
+          "pattern": "^[a-zA-Z0-9-]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scenarios": {
+      "type": "array",
+      "description": "Named test scenarios for quick state switching",
+      "items": {
+        "$ref": "#/definitions/scenario"
+      }
+    },
+    "log_level": {
+      "type": "string",
+      "description": "Logging verbosity level",
+      "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+      "default": "INFO"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "device": {
+      "type": "object",
+      "description": "Simulated Deako device (light switch/dimmer)",
+      "required": ["uuid", "name", "capabilities", "state"],
+      "properties": {
+        "uuid": {
+          "type": "string",
+          "description": "Unique device identifier (UUID v4)",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "examples": ["a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable device name",
+          "minLength": 1,
+          "maxLength": 100,
+          "examples": ["Kitchen Overhead", "Living Room Main"]
+        },
+        "capabilities": {
+          "type": "array",
+          "description": "Device capabilities (must include 'power', optionally 'dim')",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "enum": ["power", "dim"]
+          },
+          "contains": {
+            "const": "power"
+          }
+        },
+        "state": {
+          "$ref": "#/definitions/deviceState"
+        }
+      },
+      "additionalProperties": false
+    },
+    "deviceState": {
+      "type": "object",
+      "description": "Current device state (power and optional dim level)",
+      "required": ["power"],
+      "properties": {
+        "power": {
+          "type": "boolean",
+          "description": "Power state (on=true, off=false)"
+        },
+        "dim": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "description": "Dim level percentage (0-100, only for dimmable devices)",
+              "minimum": 0,
+              "maximum": 100
+            },
+            {
+              "type": "null",
+              "description": "Null for non-dimmable devices"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "scenario": {
+      "type": "object",
+      "description": "Named test scenario with predefined device states",
+      "required": ["name", "device_states"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique scenario identifier",
+          "pattern": "^[a-z0-9-]+$",
+          "examples": ["all-on", "evening-mode", "all-off"]
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable scenario description",
+          "examples": ["All lights on at 100%", "Evening ambiance lighting"]
+        },
+        "device_states": {
+          "type": "object",
+          "description": "Map of device UUID to desired state",
+          "patternProperties": {
+            "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$": {
+              "$ref": "#/definitions/deviceState"
+            }
+          },
+          "additionalProperties": false,
+          "minProperties": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "examples": [
+    {
+      "devices": [
+        {
+          "uuid": "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789",
+          "name": "Kitchen Overhead",
+          "capabilities": ["power", "dim"],
+          "state": {
+            "power": false,
+            "dim": 0
+          }
+        },
+        {
+          "uuid": "b2c3d4e5-f6a7-4890-b123-c4d5e6f7a890",
+          "name": "Living Room Main",
+          "capabilities": ["power"],
+          "state": {
+            "power": false,
+            "dim": null
+          }
+        }
+      ],
+      "network": {
+        "host": "0.0.0.0",
+        "port": 23,
+        "http_port": 8080,
+        "mdns_name": "local-integration"
+      },
+      "scenarios": [
+        {
+          "name": "all-on",
+          "description": "All lights powered on",
+          "device_states": {
+            "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789": {
+              "power": true,
+              "dim": 100
+            },
+            "b2c3d4e5-f6a7-4890-b123-c4d5e6f7a890": {
+              "power": true,
+              "dim": null
+            }
+          }
+        }
+      ],
+      "log_level": "INFO"
+    }
+  ]
+}

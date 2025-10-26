@@ -3,7 +3,10 @@
 **Feature Branch**: `001-deako-hub-simulator`  
 **Created**: October 15, 2025  
 **Status**: Draft  
-**Input**: User description: "I want to be able to test this codebase against a simulated Deako hub in a way that will fully exercise as much of the home assistant integration logic as possible. This means real telnet calls using real sockets. So what that means is that I'd like for you to write the specifications for a Deako simulator that can run here on Windows or MacOS with a real IP address such that anything discovering deako devices actually sees the simulator. It must replicate every single functionality (and quirk) of the deako hub and its devices. Additionally, it must have solid controls that will enable the right hooks for choosing all the scenarios to simulate"
+**Input**: User description: "I want to be able to test this codebase against a simulated Deako hub in a way that will fully exerci- **FR-022**: Simulator MUST properly handle message framing (newline-delimited JSON or hub's actual framing)
+- **FR-023**: Simulator MUST enforce 100ms minimum spacing between commands to same device; commands arriving <100ms after previous command MUST be silently dropped without response to replicate real hub "first-in-wins" behavior (validated October 2025: research/rate-limiting-systematic-test-2025-10-18.md); this replicates the actual hardware behavior where rapid commands are silently ignored, not queued or acknowledged
+
+#### Protocol Quirks and Edge Casess much of the home assistant integration logic as possible. This means real telnet calls using real sockets. So what that means is that I'd like for you to write the specifications for a Deako simulator that can run here on Windows or MacOS with a real IP address such that anything discovering deako devices actually sees the simulator. It must replicate every single functionality (and quirk) of the deako hub and its devices. Additionally, it must have solid controls that will enable the right hooks for choosing all the scenarios to simulate"
 
 ## Hardware Validation Testing
 
@@ -13,7 +16,7 @@ All functional requirements have been validated against real Deako hub hardware 
 
 | Test | Research Document | Key Findings | Spec Impact |
 |------|------------------|--------------|-------------|
-| **#1: Rate Limiting** | [rate-limiting-systematic-test-2025-10-18.md](./research/rate-limiting-systematic-test-2025-10-18.md) | 100ms minimum spacing (not 800ms), silent dropping, no DEVICE_BUSY errors | FR-023, FR-064, FR-074 |
+| **#1: Rate Limiting** | [rate-limiting-systematic-test-2025-10-18.md](./research/rate-limiting-systematic-test-2025-10-18.md) | 100ms minimum spacing (not 800ms), silent dropping, no DEVICE_BUSY errors | FR-023, FR-064 |
 | **#2: Multi-Connection** | [multi-connection-test-2025-10-18.md](./research/multi-connection-test-2025-10-18.md) | Passive rejection: accepts connections but only first is functional | FR-072 |
 | **#3: Dim Validation** | [dim-validation-test-2025-10-18.md](./research/dim-validation-test-2025-10-18.md) | No validation: accepts all values (-1, 101, 1000, decimals) | FR-071 |
 | **#4: DEVICE_POLL** | [device-state-test-2025-10-18.md](./research/device-state-test-2025-10-18.md) | Works with correct format; quirk: returns status="error" on success | Multiple |
@@ -300,9 +303,8 @@ As an integration developer, I want the simulator to provide detailed logging of
 - **FR-029**: Simulator MUST handle rapid successive commands for the same device by processing sequentially
 - **FR-030**: Simulator MUST support simulation of partial message delivery (truncated JSON) to test buffer handling
 - **FR-063**: Simulator MUST use CRLF line endings (`\r\n`) for all JSON messages, not just LF (`\n`) (verified requirement from official API documentation)
-- **FR-064**: Simulator MUST NOT send DEVICE_BUSY errors by default (verified through testing: 110 commands at various speeds produced zero DEVICE_BUSY errors); real hub silently drops commands instead of sending error codes; optional testing mode can enable DEVICE_BUSY errors for integration testing purposes but this mode should be clearly documented as non-realistic behavior used only for testing error handling code paths
-- **FR-065**: Simulator MUST send unsolicited EVENT messages before completing DEVICE_LIST response to replicate real hub behavior observed in testing
-- **FR-074**: Simulator MUST replicate real hub's success rate curve based on command spacing: 0ms spacing yields ~5% response rate (1 out of 20 commands), 50ms spacing yields ~70% response rate (14 out of 20 commands), 100ms spacing yields 100% response rate (20 out of 20 commands); this replicates the first-command-wins pattern where only the first command in a burst receives a response and subsequent commands are silently dropped
+- **FR-064**: Simulator MUST NOT send DEVICE_BUSY errors (verified through testing: 110 commands at various speeds produced zero DEVICE_BUSY errors); real hub silently drops commands arriving too quickly instead of sending error codes
+- **FR-065**: Simulator MUST support asynchronous EVENT messages that can arrive at any time, including during DEVICE_LIST processing (validated October 2025: EVENTs arrive if devices change state externally during request processing, e.g., physical button press or other client control); clients must handle unsolicited EVENTs interleaved with DEVICE_LIST response and DEVICE_FOUND stream; EVENTs are NOT buffered/queued before DEVICE_LIST response (validated October 2025: 10/10 tests showed zero pre-response EVENTs); sequence is: DEVICE_LIST response → DEVICE_FOUND stream → potential interleaved EVENTs if external changes occur
 - **FR-066**: Simulator MUST include status "error" field and error code in data.code for all error responses, using codes that exist on real hardware (verified October 2025): REQUEST_UNKNOWN (invalid message type), REQUEST_MALFORMED (valid JSON missing required fields), REQUEST_INVALID (invalid data values including non-existent device UUID); codes that do NOT exist on real hardware: DEVICE_BUSY (hub silently drops instead), DEVICE_UNKNOWN (hub returns REQUEST_INVALID with message "device could not be found"); optional testing modes may enable DEVICE_BUSY for error handling testing but must be clearly documented as non-realistic behavior
 - **FR-077**: Simulator MUST silently ignore malformed JSON syntax (invalid JSON structure) without sending error responses or disconnecting the client (verified October 2025: real hub ignores invalid JSON like `{this is not valid json}` with no response); REQUEST_MALFORMED error code is only for valid JSON missing required message fields, not for JSON syntax errors; connection must remain functional after malformed JSON is received
 - **FR-078**: Simulator MUST accept messages with extra/unknown fields and silently ignore them (verified October 2025: real hub accepts PING with extra fields like "extraField1", "extraField2", etc. and processes message normally); this permissive parsing enables protocol evolution where newer clients can work with older hubs
@@ -494,13 +496,12 @@ The following functional requirements have been updated based on research:
 
 - ✅ **FR-001**: mDNS service type MUST be "_telnet" with service name "local-integration" (verified against official API documentation)
 - ✅ **FR-021**: TransactionId (UUID v4) required for all solicited requests
-- ✅ **FR-023**: Updated with actual timing behavior - 100ms processing per command, silent dropping instead of errors (verified through systematic testing October 2025)
+- ✅ **FR-023**: Updated with actual timing behavior - 100ms minimum spacing for commands, silent dropping of rapid commands (verified through systematic testing October 2025)
 - ✅ **FR-027**: Non-existent device UUIDs return error response with `status: "error"` and `data.code: "DEVICE_UNKNOWN"`
 - ✅ **FR-063**: All messages use CRLF (`\r\n`) line endings
 - ✅ **FR-064**: Updated to reflect that DEVICE_BUSY errors do NOT occur in real hubs; silent dropping is actual behavior (verified: 110 commands tested, zero DEVICE_BUSY errors)
-- ✅ **FR-065**: Unsolicited EVENT messages sent before DEVICE_LIST response completes
+- ✅ **FR-065**: CORRECTED - EVENTs can arrive asynchronously during DEVICE_LIST but are NOT buffered/queued before response (validated October 2025: 10/10 tests showed zero pre-response EVENTs; original January 2025 observation of pre-response EVENTs was due to lights being used during test, not hub buffering)
 - ✅ **FR-066**: All error responses include `status: "error"` and error code in `data.code`
-- ✅ **FR-074**: NEW - Success rate curve based on command spacing (0ms=5%, 50ms=70%, 100ms=100%) replicates first-command-wins pattern
 - ✅ **FR-075**: NEW - EVENT messages must include full device state (power + dim), not just changed fields (verified October 2025: physical button tests confirmed full state always included)
 - ✅ **FR-076**: NEW - Physical button simulation via HTTP API, toggle behavior, immediate EVENT broadcast, no conflicts with CONTROL commands (verified October 2025: minimum ~430ms between physical button presses, no debouncing needed)
 - ✅ **FR-066**: UPDATED - Only 3 of 5 documented error codes actually exist (verified October 2025: REQUEST_UNKNOWN, REQUEST_MALFORMED, REQUEST_INVALID exist; DEVICE_BUSY and DEVICE_UNKNOWN do not exist)
@@ -588,7 +589,7 @@ All functional requirements above have been validated through systematic hardwar
 
 ### Complete Research Index
 
-1. **[Rate Limiting (100ms minimum)](./research/rate-limiting-systematic-test-2025-10-18.md)** - FR-023, FR-064, FR-074  
+1. **[Rate Limiting (100ms minimum)](./research/rate-limiting-systematic-test-2025-10-18.md)** - FR-023, FR-064  
    Test: [`tests/test-rate-limiting-v2.ps1`](./tests/test-rate-limiting-v2.ps1)
 
 2. **[Multi-Connection (Passive Rejection)](./research/multi-connection-test-2025-10-18.md)** - FR-072  
