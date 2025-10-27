@@ -116,13 +116,41 @@ You **MUST** consider the user input before proceeding (if not empty).
    - **Integration work**: Database connections, middleware, logging, external services
    - **Polish and validation**: Unit tests, performance optimization, documentation
 
-8. Progress tracking and error handling:
-   - Report progress after each completed task
-   - Halt execution if any non-parallel task fails
-   - For parallel tasks [P], continue with successful tasks, report failed ones
+8. Progress tracking, validation, and error handling:
+   - After completing each task:
+     a. Mark task [X] in tasks.md
+     b. Immediately execute quality gate validation using execute_prompt:
+        - Tool: execute_prompt
+        - Description: "Validate task {task_id}"
+        - Prompt: "Use prompt file .github/prompts/tola.spec.task.validate.prompt.md to validate task {task_id}. Arguments: task_ids={task_id} feature_path={feature_path}"
+     c. Parse the validation response:
+        - Look for "✅ VALIDATION PASSED" or "❌ VALIDATION FAILED"
+        - Extract validation report path from response
+     d. Handle validation result:
+        - **PASS**: Proceed to next task
+        - **FAIL**: Validator will automatically uncheck the task [ ] in tasks.md - enter retry loop (see below)
+   
+   - Validation failure retry loop (maximum 2 attempts per task):
+     a. Re-read tasks.md to confirm task is now unchecked [ ] (validator did this automatically)
+     b. Read the validation report from the path in validator's response
+     c. Analyze all CRITICAL issues listed in the report
+     d. Re-implement the task addressing every CRITICAL issue
+     e. Mark task [X] again in tasks.md
+     f. Execute validation again using execute_prompt
+     g. If validator unchecks task again, repeat loop
+     h. Continue until PASS or max 2 retries reached
+   
+   - If task fails validation after 2 retry attempts:
+     a. HALT execution immediately - do NOT proceed to next task
+     b. Task will remain unchecked [ ] in tasks.md
+     c. Report to user: "BLOCKED: Task {task_id} failed validation after 2 retries"
+     d. Include validation report path in your response
+     e. List the remaining CRITICAL issues
+     f. Wait for human intervention
+   
+   - For parallel tasks [P]: Validate each one after completion, continue with successful tasks
    - Provide clear error messages with context for debugging
-   - Suggest next steps if implementation cannot proceed
-   - **IMPORTANT** For completed tasks, make sure to mark the task off as [X] in the tasks file.
+   - **IMPORTANT**: Never skip validation. Each task completion triggers validation cycle.
 
 9. Completion validation:
    - Verify all required tasks are completed
