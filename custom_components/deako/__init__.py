@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable
 from typing import Callable
 
 import atomics
@@ -112,30 +113,27 @@ def set_delay_options_if_needed(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 async def get_connection_address(
     hass: HomeAssistant, entry: ConfigEntry
-) -> Callable[[], str] or None:
-    """Get the connection address."""
+) -> Callable[[], Awaitable[str]] | None:
+    """Resolve the manually configured hub address, or None to use discovery.
 
-    get_address = None
+    Home Assistant always wraps a config entry's options and data in a
+    MappingProxyType, so neither is ever None -- even when the user configured
+    nothing. Presence therefore has to be tested on CONF_IP_ADDRESS itself;
+    testing the mapping would always succeed and yield the address "None:None".
+    """
+    for source in (entry.options, entry.data):
+        ip_address = source.get(CONF_IP_ADDRESS) if source else None
+        if ip_address is None:
+            continue
 
-    if entry.options is not None:
+        address = f"{ip_address}:{source.get(CONF_PORT)}"
 
-        async def get_address_method() -> str:
-            return (
-                f"{entry.options.get(CONF_IP_ADDRESS)}:{entry.options.get(CONF_PORT)}"
-            )
+        async def get_address_method(address: str = address) -> str:
+            return address
 
-        get_address = get_address_method
-        _LOGGER.info("Test: %s", await get_address_method())
-        _LOGGER.info("Test: %s", await get_address())
-    elif entry.data is not None:
+        return get_address_method
 
-        async def get_address_method() -> str:
-            return f"{entry.data.get(CONF_IP_ADDRESS)}:{entry.data.get(CONF_PORT)}"
-
-        get_address = get_address_method
-        _LOGGER.info("Test: %s", await get_address_method())
-        _LOGGER.info("Test: %s", await get_address())
-    return get_address
+    return None
 
 
 async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -146,22 +144,10 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         hass.data[DOMAIN] = hass_data
 
     is_address_hardcoded = False
-    if entry.options is not None:
+    get_address = await get_connection_address(hass, entry)
+
+    if get_address is not None:
         is_address_hardcoded = True
-
-        async def get_address_method() -> str:
-            return (
-                f"{entry.options.get(CONF_IP_ADDRESS)}:{entry.options.get(CONF_PORT)}"
-            )
-
-        get_address = get_address_method
-    elif entry.data is not None:
-        is_address_hardcoded = True
-
-        async def get_address_method() -> str:
-            return f"{entry.data.get(CONF_IP_ADDRESS)}:{entry.data.get(CONF_PORT)}"
-
-        get_address = get_address_method
     else:
         if hass_data.get(DISCOVERER_ID) is None:
             _zc = await zeroconf.async_get_instance(hass)
