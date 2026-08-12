@@ -87,7 +87,7 @@ As an integration developer, I want to run the Deako simulator on my local machi
 
 **Acceptance Scenarios**:
 
-1. **Given** the simulator is started on Windows or MacOS, **When** a device scans for mDNS services with type "_telnet" and name "local-integration", **Then** the simulator must be discoverable with hostname, IP address, and port 23
+1. **Given** the simulator is started on Windows or MacOS, **When** a device scans for mDNS services of type `_deako._tcp.local.` (as pydeako and Home Assistant do) or `_telnet._tcp.local.`, **Then** the simulator must be discoverable on both types with hostname, IP address, and port
 2. **Given** the simulator is discoverable, **When** a telnet client connects to the simulator's IP on port 23, **Then** the simulator must accept the connection and maintain an open socket
 3. **Given** a telnet connection is established, **When** the connection is idle, **Then** the simulator must send periodic keep-alive messages or handle inactivity as a real hub does
 4. **Given** a telnet connection exists, **When** the client disconnects, **Then** the simulator must properly close the connection and allow reconnection
@@ -255,7 +255,7 @@ As an integration developer, I want the simulator to provide detailed logging of
 
 #### Discovery and Network
 
-- **FR-001**: Simulator MUST advertise itself via mDNS/Zeroconf using service type "_telnet" with service name "local-integration" on the local network (verified against real hub and official API documentation)
+- **FR-001**: Simulator MUST advertise itself via mDNS/Zeroconf using BOTH service types published by a real hub: `_deako._tcp.local.` and `_telnet._tcp.local.` (validated August 2026 against two production hubs: research/mdns-service-type-test-2026-08-11.md). The `_deako._tcp.local.` advertisement is mandatory for discovery because pydeako's `DeakoDiscoverer` hardcodes it as `DEAKO_TYPE` and the Home Assistant integration manifest declares it under `"zeroconf"`; advertising only `_telnet` makes the simulator undiscoverable. Advertisements MUST include a resolvable address, because pydeako derives its connection address from `ServiceInfo.addresses` and silently discards services exposing none.
 - **FR-002**: Simulator MUST bind to a configurable IP address and port (default port 23) for telnet connections
 - **FR-003**: Simulator MUST run on both Windows and MacOS operating systems without requiring platform-specific changes to configuration
 - **FR-004**: Simulator MUST support binding to localhost (127.0.0.1) for isolated testing or to a LAN IP address for network-wide discovery
@@ -468,11 +468,13 @@ As an integration developer, I want the simulator to provide detailed logging of
 - `REQUEST_MALFORMED`: Invalid JSON structure
 - `REQUEST_INVALID`: Invalid data values (e.g., bad UUID format)
 
-**mDNS Discovery** (CORRECTED):
-- Service Type: `"_telnet"` (NOT "_deako._tcp.local." as initially assumed)
-- Service Name: `"local-integration"`
-- Port: 23 (telnet)
+**mDNS Discovery** (CORRECTED August 2026 - see research/mdns-service-type-test-2026-08-11.md):
+- Service Types: **both** `_deako._tcp.local.` and `_telnet._tcp.local.` are advertised by a real hub
+- `_deako._tcp.local.` instance name is the hub serial (e.g. `HUB-SERIAL-A`); this is the type pydeako and Home Assistant browse
+- `_telnet._tcp.local.` instance name follows `local-integration-N`
+- Port: 23 (telnet) for both
 - Connection Flow: Discover via mDNS → Connect to IP:23 → Send DEVICE_LIST
+- NOTE: the earlier claim that `_telnet` replaced `_deako._tcp.local.` was wrong; the January 2025 observation of `_telnet` was correct but both types were present all along
 
 **Observed Quirks**:
 - Unsolicited EVENT messages arrive before DEVICE_LIST response completes
@@ -494,7 +496,7 @@ As an integration developer, I want the simulator to provide detailed logging of
 
 The following functional requirements have been updated based on research:
 
-- ✅ **FR-001**: mDNS service type MUST be "_telnet" with service name "local-integration" (verified against official API documentation)
+- ✅ **FR-001**: mDNS MUST advertise both `_deako._tcp.local.` and `_telnet._tcp.local.` with a resolvable address (corrected August 2026 against two production hubs; the previous `_telnet`-only requirement made the simulator undiscoverable by pydeako and Home Assistant)
 - ✅ **FR-021**: TransactionId (UUID v4) required for all solicited requests
 - ✅ **FR-023**: Updated with actual timing behavior - 100ms minimum spacing for commands, silent dropping of rapid commands (verified through systematic testing October 2025)
 - ✅ **FR-027**: Non-existent device UUIDs return error response with `status: "error"` and `data.code: "DEVICE_UNKNOWN"`

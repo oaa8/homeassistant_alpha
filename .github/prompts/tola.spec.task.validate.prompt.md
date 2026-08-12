@@ -11,11 +11,24 @@ description: "Perform comprehensive, critical review of completed task(s) agains
 $ARGUMENTS
 ```
 
-Expected format: `task_ids=T001,T002 [feature_path=specs/001-deako-hub-simulator]`
+Expected format: `task_ids=T001 [feature_path=specs/001-deako-hub-simulator]`
 
 If feature_path is not provided, will use check-prerequisites.ps1 to detect it.
 
 You **MUST** parse the user input before proceeding.
+
+⚠️ **SINGLE TASK ONLY**: This validation agent processes ONE task at a time. If multiple task IDs are provided (e.g., T001,T002), respond with:
+
+```
+❌ VALIDATION REQUEST REJECTED
+
+Reason: Multiple tasks provided (T001, T002)
+Requirement: Validate one task at a time
+
+Please re-invoke with a single task ID.
+```
+
+Then stop execution immediately. Do not proceed with validation.
 
 ## Mission
 
@@ -42,6 +55,7 @@ Perform a **comprehensive, critical review** of the specified task(s) to ensure 
 
 4. **Capture original prompt**:
    - Store the full $ARGUMENTS input for inclusion in validation report
+   - Immediately share in the chat response to the agent the original $ARGUMENTS you received so that's in the chat history (but don't stop working when sharing that message)
 
 ## Validation Framework
 
@@ -200,14 +214,19 @@ Execute systematically:
 4. If orphaned work exists → task is INCOMPLETE
 
 **Step 7: Create Validation Report**
-1. Generate filename: `validation-{task_ids_joined_by_underscore}-{YYYY-MM-DD-HHMMSS}.md`
+1. Generate filename: `validation-{task_id}-{YYYY-MM-DD-HHMMSS}.md`
 2. Build full path: `{feature_path}/validations/{filename}`
 3. Write complete report using create_file tool with the format specified below
-4. If create_file fails, try using run_in_terminal to write the file:
-   - On Windows: `New-Item -ItemType File -Path "{path}" -Force | Out-Null; Set-Content -Path "{path}" -Value "{content}"`
-   - On Unix: `cat > "{path}" << 'EOF'\n{content}\nEOF`
-5. Verify file was created using file_search or list_dir
-6. If file still doesn't exist, store report content in your response and warn user
+4. **VERIFY FILE EXISTS**: Use terminal commands to confirm the file was actually created and has content
+5. **IF FILE MISSING OR EMPTY**: Keep trying alternative methods until the file exists with full content on disk
+6. Do not proceed to Step 8 until you have confirmed via terminal that the validation report file exists and is readable
+
+⚠️ **Do Not Trust Tool Responses**
+
+- Treat every `create_file`, `apply_patch`, or similar success message as unverified until you confirm the file on disk using `run_in_terminal`
+- Run explicit shell commands (PowerShell `dir`, `Get-Content`, `type`; bash `ls`, `cat`) showing the path and a content preview
+- If terminal output contradicts a tool response, believe the terminal, recreate the file, and re-run the verification commands
+- Capture and share the verification output in chat so the calling agent can audit the evidence
 
 **Step 8: Generate Concise Chat Response**
 1. Format the concise response per guidelines (under 20 lines)
@@ -223,12 +242,12 @@ Execute systematically:
 
 Create report at:
 ```
-{feature_path}/validations/validation-{task_ids_joined_by_underscore}-{YYYY-MM-DD-HHMMSS}.md
+{feature_path}/validations/validation-{task_id}-{YYYY-MM-DD-HHMMSS}.md
 ```
 
-Example: `specs/001-deako-hub-simulator/validations/validation-T001_T002_T003-2025-10-25-143022.md`
+Example: `specs/001-deako-hub-simulator/validations/validation-T001-2025-10-25-143022.md`
 
-**You MUST actually create this file using create_file tool before providing your chat response.**
+**You MUST actually create this file and verify it exists on disk via terminal commands before providing your chat response.**
 
 ### Report Format
 
@@ -236,7 +255,7 @@ Example: `specs/001-deako-hub-simulator/validations/validation-T001_T002_T003-20
 # Task Validation Report
 
 **Generated**: {current_datetime}
-**Task ID(s)**: {task_ids}
+**Task ID**: {task_id}
 **Validator**: GitHub Copilot (AI Agent)
 **Feature Path**: {feature_path}
 
@@ -453,7 +472,7 @@ Your chat response should be under 20 lines and follow this format:
    ```
    ✅ VALIDATION PASSED
    
-   Tasks: T001, T002
+   Task: T001
    Status: COMPLETE - All requirements met
    
    Summary:
@@ -462,9 +481,9 @@ Your chat response should be under 20 lines and follow this format:
    • Test coverage: 96%
    • No critical issues found
    
-   Tasks marked complete in tasks.md
+   Task marked complete in tasks.md
    
-   Full report: specs/001-deako-hub-simulator/validations/validation-T001_T002-2025-10-25-143022.md
+   Full report: specs/001-deako-hub-simulator/validations/validation-T001-2025-10-25-143022.md
    ```
 
 ### If Task is INCOMPLETE (❌)
@@ -476,7 +495,7 @@ Your chat response should be under 20 lines and follow this format:
    ```
    ❌ VALIDATION FAILED
    
-   Tasks: T001, T002
+   Task: T001
    Status: INCOMPLETE - 3 critical issues
    
    Critical Issues:
@@ -484,9 +503,9 @@ Your chat response should be under 20 lines and follow this format:
    2. 3 untracked TODOs in server.py (Principle VI)
    3. Swallowed exceptions in connection handler (Principle VIII)
    
-   Tasks unmarked in tasks.md
+   Task unmarked in tasks.md
    
-   Full report: specs/001-deako-hub-simulator/validations/validation-T001_T002-2025-10-25-143022.md
+   Full report: specs/001-deako-hub-simulator/validations/validation-T001-2025-10-25-143022.md
    ```
 
 ### Output Guidelines
@@ -544,16 +563,23 @@ If you find any of these, the task is **INCOMPLETE** - no exceptions.
 
 ## Execution
 
-Now proceed with validation of task(s): **{parse from $ARGUMENTS}**
+Now proceed with validation of task: **{parse from $ARGUMENTS}**
 
-1. Parse $ARGUMENTS for task_ids and feature_path
-2. Load all required artifacts
-3. Execute validation framework systematically
-4. Make COMPLETE/INCOMPLETE decision
-5. Write the validation report (with error handling and verification)
-6. Update tasks.md accordingly (mark complete or incomplete)
-7. Provide concise chat response with report location
+1. Parse $ARGUMENTS for task_id (singular) and feature_path
+2. **CHECK**: If multiple task IDs provided, reject request and stop
+3. Load all required artifacts
+4. Execute validation framework systematically
+5. Make COMPLETE/INCOMPLETE decision
+6. Write the validation report file
+7. **VERIFY**: Use terminal commands to confirm the file exists and has content
+8. **RETRY**: If file doesn't exist or is empty, keep trying alternative approaches until it's created successfully
+9. Update tasks.md accordingly (mark complete or incomplete)
+10. Provide concise chat response with report location
 
-The validation report file is the primary output. If file creation fails after trying both create_file and run_in_terminal approaches, include a warning in your response.
+**CRITICAL**: The validation report file MUST exist on disk before you complete. Verify using terminal commands, not tool responses. Don't give up until the file is confirmed readable.  If you have to do workaround, please make sure to go back and fill that file with the full report's content.  You have failed if the calling agent can't see the file you created so you must be ultra sure it exists and has the full contents
 
 **Be thorough. Be critical. Protect quality.**
+
+If a previous task has not yet been validated, please call that out in your chat response to prompt the agent to return to that task and validate it.
+
+In the file name, please include the word "passed" or "failed" based on the outcome of the validation.

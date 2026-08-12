@@ -24,7 +24,7 @@ cd homeassistant_alpha
 # Checkout simulator branch
 git checkout 001-deako-hub-simulator
 
-# Install simulator (placeholder - actual installation TBD during implementation)
+# Install simulator with dependencies
 pip install -e .
 ```
 

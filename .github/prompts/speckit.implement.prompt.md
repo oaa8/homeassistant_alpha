@@ -119,7 +119,12 @@ You **MUST** consider the user input before proceeding (if not empty).
 8. Progress tracking, validation, and error handling:
    - After completing each task:
      a. Mark task [X] in tasks.md
-     b. Immediately execute quality gate validation using execute_prompt:
+     b. IMMEDIATELY stop and execute quality gate validation using execute_prompt
+        
+        DO NOT IMPLEMENT THE NEXT TASK UNTIL VALIDATION PASSES.
+        DO NOT BATCH MULTIPLE TASKS BEFORE VALIDATING.
+        NEVER RUN THE VALIDATION YOURSELF.  IT MUST BE DONE BY execute_prompt.  NEVER, EVER read the validation prompt file yourself
+        
         - Tool: execute_prompt
         - Description: "Validate task {task_id}"
         - Prompt: "Use prompt file .github/prompts/tola.spec.task.validate.prompt.md to validate task {task_id}. Arguments: task_ids={task_id} feature_path={feature_path}"
@@ -138,7 +143,7 @@ You **MUST** consider the user input before proceeding (if not empty).
      e. Mark task [X] again in tasks.md
      f. Execute validation again using execute_prompt
      g. If validator unchecks task again, repeat loop
-     h. Continue until PASS or max 2 retries reached
+     h. Continue until PASS or max 7 retries reached
    
    - If task fails validation after 2 retry attempts:
      a. HALT execution immediately - do NOT proceed to next task

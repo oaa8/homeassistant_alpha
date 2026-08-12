@@ -1,0 +1,39 @@
+{
+  "devices": [
+    {
+      "uuid": "550e8400-e29b-41d4-a716-446655440001",
+      "name": "Living Room Light",
+      "capabilities": ["power"],
+      "state": {
+        "power": false,
+        "dim": null
+      }
+    },
+    {
+      "uuid": "550e8400-e29b-41d4-a716-446655440002",
+      "name": "Bedroom Dimmer",
+      "capabilities": ["power", "dim"],
+      "state": {
+        "power": false,
+        "dim": 0
+      }
+    },
+    {
+      "uuid": "550e8400-e29b-41d4-a716-446655440003",
+      "name": "Kitchen Light",
+      "capabilities": ["power", "dim"],
+      "state": {
+        "power": true,
+        "dim": 75
+      }
+    }
+  ],
+  "network": {
+    "host": "0.0.0.0",
+    "port": 8023,
+    "http_port": 8080,
+    "mdns_name": "deako-test-simulator"
+  },
+  "scenarios": [],
+  "log_level": "INFO"
+}

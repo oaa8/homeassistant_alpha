@@ -1,0 +1,33 @@
+{
+  "devices": [
+    {
+      "uuid": "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789",
+      "name": "Kitchen Overhead",
+      "capabilities": ["power", "dim"],
+      "state": {"power": false, "dim": 0}
+    },
+    {
+      "uuid": "b2c3d4e5-f6a7-4890-b123-c4d5e6f7a890",
+      "name": "Living Room",
+      "capabilities": ["power"],
+      "state": {"power": false, "dim": null}
+    }
+  ],
+  "network": {
+    "host": "0.0.0.0",
+    "port": 23,
+    "http_port": 8080,
+    "mdns_name": "local-integration"
+  },
+  "scenarios": [
+    {
+      "name": "all-on",
+      "description": "All lights on at 100%",
+      "device_states": {
+        "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789": {"power": true, "dim": 100},
+        "b2c3d4e5-f6a7-4890-b123-c4d5e6f7a890": {"power": true, "dim": null}
+      }
+    }
+  ],
+  "log_level": "INFO"
+}
