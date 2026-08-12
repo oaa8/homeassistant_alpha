@@ -1,6 +1,9 @@
 #!/bin/bash
 # Onboard the latest-HA instance, then report whether the Deako simulator was
 # auto-discovered over mDNS (now possible under WSL mirrored networking).
+# Generate a throwaway password per run rather than committing a literal.
+# This instance is local, disposable and destroyed by the teardown script.
+HA_TEST_PASSWORD="${HA_TEST_PASSWORD:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=')}"
 BASE="http://127.0.0.1:8123"
 CLIENT_ID="$BASE/"
 HA_DIR="$HOME/ha-test-latest"

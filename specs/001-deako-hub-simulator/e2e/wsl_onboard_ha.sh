@@ -3,6 +3,9 @@
 # simulator running on the Windows host. Prints the resulting light entities.
 set -e
 
+# Generate a throwaway password per run rather than committing a literal.
+# This instance is local, disposable and destroyed by the teardown script.
+HA_TEST_PASSWORD="${HA_TEST_PASSWORD:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=')}"
 BASE="http://127.0.0.1:8123"
 CLIENT_ID="$BASE/"
 SIM_IP="192.168.86.65"
