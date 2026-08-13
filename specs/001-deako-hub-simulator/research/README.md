@@ -134,6 +134,26 @@ This directory contains detailed findings from hardware testing and protocol ana
   - Spec Updates: NEW FR-078 through FR-083 (6 new requirements)
   - **Simulator Implication**: Permissive JSON parsing, uppercase type enforcement, string length limits
 
+### Client Library Behavior (pydeako)
+- **`zero-dim-pydeako-regression-2026-08-12.md`** ⭐ **DEFINITIVE**
+  - Harness: `../e2e/zero_dim_experiment.py`, `../e2e/zero_dim_sim_runner.py`,
+    `../e2e/wsl_run_zero_dim_experiment.sh`
+  - Raw captures: `data/zero-dim-pydeako-0.6.0.json`, `data/zero-dim-pydeako-0.3.1.json`
+  - Target: **the simulator**, not real hardware (research ticket
+    [deako-house-wayfinder#12](https://github.com/oaa8/deako-house-wayfinder/issues/12))
+  - **Critical Findings**:
+    - pydeako 0.6.0's `dim or old_dim` **discards an explicit zero dim** from the
+      cached state; the wire command and the hub state are correct (display bug)
+    - The **inbound EVENT path is poisoned too** — an out-of-band change to 0%
+      is discarded as well
+    - 0.6.0 **never fires `complete_callback()`**, so the optimistic local echo is
+      gone and the EVENT path is the only cache writer
+    - A `find_devices()` refresh **repairs** the cache (~120 s in practice)
+    - 0.3.1 handles zero correctly but **wipes cached dim to `None`** on a plain
+      on/off, which makes the integration's `brightness` property raise `TypeError`
+    - Home Assistant 2025.11.0 **never sends brightness 0** to the integration, but
+      **brightness 1 becomes a falsy `0.0`** via the integration's own conversion
+
 ### Connection Lifecycle
 - **`connection-lifecycle-test-2025-10-18.md`** ⭐ **DEFINITIVE**
   - Test Script: `../tests/test-connection-lifecycle.ps1`

@@ -1,0 +1,641 @@
+{
+  "label": "0.3.1",
+  "pydeako_version": "0.3.1",
+  "python": "3.12.3 (main, Nov  6 2025, 13:44:16) [GCC 13.3.0]",
+  "results": [
+    {
+      "case": "1_control_on_dim_0",
+      "description": "control_device(uuid, True, 0) - explicit int zero, power on",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 0
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 0
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 0
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"0a01f5c0-7955-4c47-af30-f8b714d04a38\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0}}}",
+          "json": {
+            "transactionId": "0a01f5c0-7955-4c47-af30-f8b714d04a38",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"0a01f5c0-7955-4c47-af30-f8b714d04a38\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603098824}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "0a01f5c0-7955-4c47-af30-f8b714d04a38",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603098824
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0}}, \"timestamp\": 1786603100825}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0
+              }
+            },
+            "timestamp": 1786603100825
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 0
+      },
+      "ha_brightness_reported": 0
+    },
+    {
+      "case": "2_control_off_dim_0",
+      "description": "control_device(uuid, False, 0) - explicit int zero, power off (the integration's async_turn_off path)",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": false,
+        "dim": 0
+      },
+      "cache_after_hub_event": {
+        "power": false,
+        "dim": 0
+      },
+      "sim_after": {
+        "power": false,
+        "dim": 0
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"2616dbed-4bc7-4acf-b359-190f7315e79e\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": false, \"dim\": 0}}}",
+          "json": {
+            "transactionId": "2616dbed-4bc7-4acf-b359-190f7315e79e",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": false,
+                "dim": 0
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"2616dbed-4bc7-4acf-b359-190f7315e79e\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603106248}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "2616dbed-4bc7-4acf-b359-190f7315e79e",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603106248
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": false, \"dim\": 0}}, \"timestamp\": 1786603108250}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": false,
+                "dim": 0
+              }
+            },
+            "timestamp": 1786603108250
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": false,
+        "dim": 0
+      },
+      "ha_brightness_reported": 0
+    },
+    {
+      "case": "3_control_on_dim_0_float",
+      "description": "control_device(uuid, True, 0.0) - float zero, what round(x/2.55, 0) returns",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 0.0
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 0
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 0
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"081b84b1-b906-431c-86d0-02bdf6146f7e\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0.0}}}",
+          "json": {
+            "transactionId": "081b84b1-b906-431c-86d0-02bdf6146f7e",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0.0
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"081b84b1-b906-431c-86d0-02bdf6146f7e\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603113677}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "081b84b1-b906-431c-86d0-02bdf6146f7e",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603113677
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0}}, \"timestamp\": 1786603115682}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0
+              }
+            },
+            "timestamp": 1786603115682
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 0
+      },
+      "ha_brightness_reported": 0
+    },
+    {
+      "case": "3b_control_on_ha_brightness_1",
+      "description": "HA brightness=1 -> round(1/2.55, 0) == 0.0, integration's exact math",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 0.0
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 0
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 0
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"f8d07b2b-3b31-4f86-8a03-624d7dd6b10a\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0.0}}}",
+          "json": {
+            "transactionId": "f8d07b2b-3b31-4f86-8a03-624d7dd6b10a",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0.0
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"f8d07b2b-3b31-4f86-8a03-624d7dd6b10a\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603121122}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "f8d07b2b-3b31-4f86-8a03-624d7dd6b10a",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603121122
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0}}, \"timestamp\": 1786603123125}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0
+              }
+            },
+            "timestamp": 1786603123125
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 0
+      },
+      "ha_brightness_reported": 0
+    },
+    {
+      "case": "3c_control_on_ha_brightness_3",
+      "description": "HA brightness=3 -> round(3/2.55, 0) == 1.0, first non-falsy dim",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 1.0
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 1
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 1
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"3e9c90e8-3446-45fc-88e5-62a3ad49bf52\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 1.0}}}",
+          "json": {
+            "transactionId": "3e9c90e8-3446-45fc-88e5-62a3ad49bf52",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 1.0
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"3e9c90e8-3446-45fc-88e5-62a3ad49bf52\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603128567}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "3e9c90e8-3446-45fc-88e5-62a3ad49bf52",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603128567
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 1}}, \"timestamp\": 1786603130569}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 1
+              }
+            },
+            "timestamp": 1786603130569
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 1
+      },
+      "ha_brightness_reported": 3
+    },
+    {
+      "case": "4_control_on_dim_none",
+      "description": "control_device(uuid, True, None) - plain on, no dim (0.3.1 is expected to wipe the cached dim here)",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": null
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 80
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 80
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"16342815-a06b-45fc-88a9-aea45ddfc621\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true}}}",
+          "json": {
+            "transactionId": "16342815-a06b-45fc-88a9-aea45ddfc621",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"16342815-a06b-45fc-88a9-aea45ddfc621\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603135992}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "16342815-a06b-45fc-88a9-aea45ddfc621",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603135992
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 80}}, \"timestamp\": 1786603137994}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 80
+              }
+            },
+            "timestamp": 1786603137994
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 80
+      },
+      "ha_brightness_reported": 204
+    },
+    {
+      "case": "5_control_on_dim_50",
+      "description": "control_device(uuid, True, 50) - non-zero sanity baseline",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 50
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 50
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 50
+      },
+      "wire": [
+        {
+          "dir": "client->hub",
+          "raw": "{\"transactionId\": \"edd82647-c09d-4680-a7b9-2409d69ee917\", \"dst\": \"deako\", \"src\": \"pydeako_default\", \"type\": \"CONTROL\", \"data\": {\"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 50}}}",
+          "json": {
+            "transactionId": "edd82647-c09d-4680-a7b9-2409d69ee917",
+            "dst": "deako",
+            "src": "pydeako_default",
+            "type": "CONTROL",
+            "data": {
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 50
+              }
+            }
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\":\"CONTROL\",\"transactionId\":\"edd82647-c09d-4680-a7b9-2409d69ee917\",\"dst\":\"pydeako_default\",\"src\":\"deako\",\"status\":\"ok\",\"timestamp\":1786603143417}",
+          "json": {
+            "type": "CONTROL",
+            "transactionId": "edd82647-c09d-4680-a7b9-2409d69ee917",
+            "dst": "pydeako_default",
+            "src": "deako",
+            "status": "ok",
+            "timestamp": 1786603143417
+          }
+        },
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 50}}, \"timestamp\": 1786603145432}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 50
+              }
+            },
+            "timestamp": 1786603145432
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 50
+      },
+      "ha_brightness_reported": 127
+    },
+    {
+      "case": "6_hub_event_dim_0",
+      "description": "Hub-originated EVENT carrying dim: 0, not initiated by the client",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 0
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 0
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 0
+      },
+      "wire": [
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 0}}, \"timestamp\": 1786603150878}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 0
+              }
+            },
+            "timestamp": 1786603150878
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 0
+      },
+      "ha_brightness_reported": 0
+    },
+    {
+      "case": "6b_hub_event_dim_25",
+      "description": "Hub-originated EVENT carrying dim: 25, non-falsy control for case 6",
+      "sim_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_before": {
+        "power": true,
+        "dim": 80
+      },
+      "cache_after_action": {
+        "power": true,
+        "dim": 25
+      },
+      "cache_after_hub_event": {
+        "power": true,
+        "dim": 25
+      },
+      "sim_after": {
+        "power": true,
+        "dim": 25
+      },
+      "wire": [
+        {
+          "dir": "hub->client",
+          "raw": "{\"type\": \"EVENT\", \"src\": \"deako\", \"data\": {\"eventType\": \"DEVICE_STATE_CHANGE\", \"target\": \"11111111-1111-4111-8111-111111111111\", \"state\": {\"power\": true, \"dim\": 25}}, \"timestamp\": 1786603158310}",
+          "json": {
+            "type": "EVENT",
+            "src": "deako",
+            "data": {
+              "eventType": "DEVICE_STATE_CHANGE",
+              "target": "11111111-1111-4111-8111-111111111111",
+              "state": {
+                "power": true,
+                "dim": 25
+              }
+            },
+            "timestamp": 1786603158310
+          }
+        }
+      ],
+      "cache_after_refresh": {
+        "power": true,
+        "dim": 25
+      },
+      "ha_brightness_reported": 64
+    }
+  ]
+}
