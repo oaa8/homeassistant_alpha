@@ -103,6 +103,22 @@ class DeakoLightSwitch(LightEntity):
             color_modes.add(ColorMode.BRIGHTNESS)
         return color_modes
 
+    @property
+    def color_mode(self) -> ColorMode:
+        """Return the active color mode.
+
+        Current Home Assistant refuses to write state for a light that
+        advertises supported_color_modes but never says which one is active:
+        "does not report a color mode", and the entity never appears. Exactly
+        one mode is ever advertised, so the active one is that one.
+
+        This is the minimum needed for the integration to function on current
+        Home Assistant at all; converging the entity on core's shape, including
+        taking dimmability from the library's is_dimmable() rather than
+        inferring it from whether dim is None, is its own ticket.
+        """
+        return next(iter(self.supported_color_modes))
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the light."""
         dim = None
