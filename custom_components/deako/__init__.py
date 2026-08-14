@@ -1,15 +1,9 @@
 """The deako integration."""
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Awaitable
 from typing import Callable
-
-import atomics
-import pydeako
-from pydeako.deako import Deako, DeviceListTimeout, FindDevicesTimeout
-from pydeako.discover import DeakoDiscoverer
 
 from homeassistant.components import zeroconf
 from homeassistant.config_entries import ConfigEntry
@@ -18,22 +12,17 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DISCOVERER_ID, DOMAIN
+from .pydeako.deako import Deako, FindDevicesError
+from .pydeako.discover import DeakoDiscoverer
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 PLATFORMS: list[Platform] = [Platform.LIGHT]
 
-ATOMIC_BOOL_FALSE = 0
-ATOMIC_BOOL_TRUE = 1
-
-TELNET_MESSAGE_DELAY = "telnet_message_receive_delay"
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up deako from a config entry."""
     entry.async_on_unload(entry.add_update_listener(update_listener))
-    # Hack to make help avoid calling a good connection a bad one
-    pydeako.deako._deako.DEVICE_FOUND_POLLING_INTERVAL_S = 60
 
     await _initiate_connection(hass, entry)
 
@@ -54,7 +43,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update Deako listeners."""
 
-    set_delay_options_if_needed(hass, entry)
     preset_adddress_or_none = await get_connection_address(hass, entry)
 
     connection = hass.data.get(DOMAIN, {}).get(entry.entry_id)
@@ -66,7 +54,7 @@ async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
                 connection.__is_address_hardcoded
                 and (
                     preset_adddress_or_none is None
-                    or connection.__address != await preset_adddress_or_none()
+                    or connection.__address != (await preset_adddress_or_none())[0]
                 )
             )
             or not connection.__is_address_hardcoded
@@ -83,43 +71,18 @@ async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await _initiate_connection(hass, entry)
 
 
-def set_delay_options_if_needed(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Set the options if needed."""
-
-    telnet_message_delay = None
-    if (
-        entry.options is not None
-        and entry.options.get(TELNET_MESSAGE_DELAY) is not None
-    ):
-        telnet_message_delay = entry.options.get(TELNET_MESSAGE_DELAY)
-    elif entry.data is not None and entry.data.get(TELNET_MESSAGE_DELAY) is not None:
-        telnet_message_delay = entry.data.get(TELNET_MESSAGE_DELAY)
-
-    if telnet_message_delay is not None:
-        value = float(telnet_message_delay)
-        if value < 1e-5:
-            _LOGGER.info(
-                "Requested telnet delay is %s which is close to zero.  Updating it to zero",
-                value,
-            )
-            value = 0
-        _LOGGER.info(
-            "Changing telnet message delay from %s to %s",
-            pydeako.deako._manager.WORKER_WAIT_S,
-            value,
-        )
-        pydeako.deako._manager.WORKER_WAIT_S = value
-
-
 async def get_connection_address(
     hass: HomeAssistant, entry: ConfigEntry
-) -> Callable[[], Awaitable[str]] | None:
+) -> Callable[[], Awaitable[tuple[str, str]]] | None:
     """Resolve the manually configured hub address, or None to use discovery.
 
     Home Assistant always wraps a config entry's options and data in a
     MappingProxyType, so neither is ever None -- even when the user configured
     nothing. Presence therefore has to be tested on CONF_IP_ADDRESS itself;
     testing the mapping would always succeed and yield the address "None:None".
+
+    pydeako 0.6.0 expects the provider to return (address, name), matching what
+    DeakoDiscoverer yields; 0.3.1 returned a bare address string.
     """
     for source in (entry.options, entry.data):
         ip_address = source.get(CONF_IP_ADDRESS) if source else None
@@ -128,8 +91,8 @@ async def get_connection_address(
 
         address = f"{ip_address}:{source.get(CONF_PORT)}"
 
-        async def get_address_method(address: str = address) -> str:
-            return address
+        async def get_address_method(address: str = address) -> tuple[str, str]:
+            return address, "configured"
 
         return get_address_method
 
@@ -157,22 +120,20 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         discoverer: DeakoDiscoverer = hass_data.get(DISCOVERER_ID)
         get_address = discoverer.get_address
 
-    set_delay_options_if_needed(hass, entry)
-
     connection = Deako(get_address)
 
     if is_address_hardcoded:
         connection.__is_address_hardcoded = True
-        connection.__address = await get_address()
+        connection.__address = (await get_address())[0]
     await connection.connect()
     try:
         await connection.find_devices()
-    except FindDevicesTimeout as exc:
-        _LOGGER.warning("Timed out finding devices")
-        await connection.disconnect()
-        raise ConfigEntryNotReady(exc) from exc
-    except DeviceListTimeout as exc:
-        _LOGGER.warning("Unexpectedly received a count of zero devices from the hub")
+    except FindDevicesError as exc:
+        # 0.6.0 collapsed FindDevicesTimeout and DeviceListTimeout into this
+        # one error. It now only fires when the hub never answered the device
+        # list request at all -- a partial enumeration is no longer fatal, see
+        # DEVIATION (O1) in the vendored find_devices().
+        _LOGGER.warning("Could not enumerate devices: %s", exc)
         await connection.disconnect()
         raise ConfigEntryNotReady(exc) from exc
 
@@ -181,64 +142,6 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await connection.disconnect()
         raise ConfigEntryNotReady(devices)
 
-    # Quick hack to get manage refreshes
-    connection.is_refreshing = atomics.atomic(width=1, atype=atomics.INT)
-    connection.is_refreshing.store(ATOMIC_BOOL_FALSE)
-    connection.is_additional_refresh_requested = atomics.atomic(
-        width=1, atype=atomics.INT
-    )
-    connection.is_additional_refresh_requested.store(ATOMIC_BOOL_FALSE)
-    overwrite_parse_data_implementation(hass, entry, connection)
-    # Quick hack to manage attempts to restore connections
-    connection.is_reconnecting = atomics.atomic(width=1, atype=atomics.INT)
-    connection.is_reconnecting.store(ATOMIC_BOOL_FALSE)
     hass.data[DOMAIN][entry.entry_id] = connection
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-
-def overwrite_parse_data_implementation(
-    hass: HomeAssistant, entry: ConfigEntry, connection: Deako
-) -> None:
-    """Overwrite the parse_data implementation."""
-
-    def new_parse_data(self, data: bytes) -> None:
-        """Replacement parse_data method that replaces self.message_buffer with an empty string if it only contains whitespace before calling the original implementation."""
-
-        if (
-            (self.message_buffer is not None)
-            and (self.message_buffer.strip() == "")
-            and len(self.message_buffer) > 0
-        ):
-            _LOGGER.info(
-                "Replacing message buffer with empty string after seeing %s whitespace characters",
-                len(self.message_buffer),
-            )
-            self.message_buffer = ""
-
-        raw_string = data.decode("utf-8")
-        if (raw_string is not None) and (raw_string.strip() == ""):
-            if self.empty_message_counter is None:
-                self.empty_message_counter = 0
-            self.empty_message_counter += 1
-            if self.empty_message_counter > 1000:
-                _LOGGER.error(
-                    "Received %s empty messages in a row.  Reloading integration to reconnect",
-                    self.empty_message_counter,
-                )
-                asyncio.ensure_future(hass.config_entries.async_reload(entry.entry_id))  # noqa: RUF006
-        else:
-            self.empty_message_counter = 0
-        pydeako.deako.utils._connection._Connection.__old_parse_data(self, data)
-
-    _LOGGER.info(
-        "Reassigning _Connection's implementation of parse_data to protect against streams of whitespace"
-    )
-
-    # This is to protect against what appeared to be a stream of whitespace characters that took the entire home assistant instance down
-    # An additional protective method would be to reconnect once a certain number of whitespace characters are seen in a row with an empty buffer.
-    if not hasattr(pydeako.deako.utils._connection._Connection, "__old_parse_data"):
-        pydeako.deako.utils._connection._Connection.__old_parse_data = (
-            pydeako.deako.utils._connection._Connection.parse_data
-        )
-        pydeako.deako.utils._connection._Connection.parse_data = new_parse_data

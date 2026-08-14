@@ -7,7 +7,7 @@ through pinging, and one to check for messages to send.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from ..discover import DevicesNotFoundException
 from ..models import (
@@ -52,14 +52,20 @@ class _Manager:
         get_address,
         incoming_json_callback,
         client_name: str | None = None,
+        on_connect: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize with get address function and incoming json callback."""
         self.get_address = get_address
         self.incoming_json_callback = incoming_json_callback
         self.pong_received = False
+        # DEVIATION (O4): see maintain_connection_worker.
+        self.pending_ping_id: str | None = None
         self.tasks = set()
         self.client_name = client_name
         self.state = _ManagerState()
+        # DEVIATION (O7): fired every time a connection is established,
+        # including reconnects, so cached state can be resynced.
+        self.on_connect = on_connect
 
     async def init_connection(self) -> None:
         """Initialize the connection process."""
@@ -93,6 +99,28 @@ class _Manager:
                 self.maintain_connection_worker()
             )
         self.state.connecting = False
+
+        # DEVIATION (O7): stock resumed listening here and never asked the hub
+        # what the state is now, so a change made during an outage could stay
+        # wrong indefinitely. Fired after the connection is live and
+        # `connecting` is cleared, so the callback can send immediately.
+        if self.on_connect is not None:
+            await self.on_connect()
+
+    def is_connected(self) -> bool:
+        """Report whether there is a live connection.
+
+        DEVIATION (O5): stock offers no honest connection-state accessor.
+        `_Connection.close()` does not move the state machine out of CONNECTED,
+        so `is_connected()` alone keeps saying yes after a close; the socket
+        check is what makes the answer truthful.
+        """
+        return (
+            not self.state.canceled
+            and self.connection is not None
+            and self.connection.is_connected()
+            and self.connection.socket.sock is not None
+        )
 
     def close(self) -> None:
         """Close connection."""
@@ -137,11 +165,22 @@ class _Manager:
         while True:
             if self.state.canceled:
                 break
+            # DEVIATION (O4): stock set a bare pong_received flag that any
+            # inbound PONG satisfied, regardless of which ping it answered, so
+            # a late pong arriving in the next window could mask a dying
+            # connection. Correlate on the transaction id that was sent.
+            #
+            # The hub is not known for certain to echo transactionId on a PONG
+            # -- the simulator does, and it was built from observed hardware,
+            # but no capture proves it on the real firmware. So a PONG that
+            # carries no transaction id still counts. That is exactly stock
+            # behaviour, never worse; if the spare switch rig confirms the echo,
+            # the fallback can go.
+            ping = device_ping_request(source=self.client_name)
+            self.pending_ping_id = ping.get("transactionId")
             self.pong_received = False
             _LOGGER.debug("Pinging for responsiveness")
-            await self.send_request(
-                _Request(device_ping_request(source=self.client_name)),
-            )
+            await self.send_request(_Request(ping))
             await asyncio.sleep(PING_WORKER_WAIT_S)
             if self.pong_received:
                 _LOGGER.debug("Pong received")
@@ -155,7 +194,18 @@ class _Manager:
         """Handle incoming json."""
         response_type = incoming_json.get("type")
         if response_type == ResponseType.PONG:
-            self.pong_received = True
+            # DEVIATION (O4): only accept the pong that answers the ping
+            # currently outstanding. See maintain_connection_worker for why an
+            # id-less pong is still accepted.
+            transaction_id = incoming_json.get("transactionId")
+            if transaction_id is None or transaction_id == self.pending_ping_id:
+                self.pong_received = True
+            else:
+                _LOGGER.debug(
+                    "Ignoring pong for ping %s, waiting on %s",
+                    transaction_id,
+                    self.pending_ping_id,
+                )
         else:
             self.incoming_json_callback(incoming_json)
 
