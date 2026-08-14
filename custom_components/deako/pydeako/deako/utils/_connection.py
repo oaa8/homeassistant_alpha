@@ -75,6 +75,24 @@ class _Connection:
             self.state = ConnectionState.ERROR
             return
 
+        # DEVIATION (O4): after a network blip the lights have to work again
+        # without anyone reloading anything -- and stock cannot get there from
+        # a clean close. When the peer sends FIN, sock_recv() returns b"" and
+        # keeps returning it, so run() spins here forever. Worse, that spin
+        # never yields: sock_recv completes synchronously at EOF, so awaiting
+        # it does not suspend, and the asyncio event loop is starved outright.
+        # The ping watchdog then never runs, the connection is never rebuilt,
+        # and inside Home Assistant the whole event loop stops.
+        #
+        # Observed, not theorised: dropping the connection from the simulator
+        # pinned a core at ~97% and hung the process indefinitely.
+        if not data:
+            _LOGGER.warning(
+                "[%s] Connection closed by the hub", self.format_name(),
+            )
+            self.state = ConnectionState.ERROR
+            return
+
         self.parse_data(data)
 
     def parse_data(self, data: bytes) -> None:
