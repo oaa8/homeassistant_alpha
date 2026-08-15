@@ -787,6 +787,14 @@ class DeakoSimulator:
         await writer.drain()
 
         for device in devices:
+            # wayfinder #16 (O10): a withheld device is counted but never
+            # announced, which is the enumeration shortfall the availability
+            # model has to survive. See QuirkManager.set_withheld_devices.
+            if self.quirk_manager.is_withheld(device.uuid):
+                logger.info(
+                    f"[SEND] {client_ip}: withholding DEVICE_FOUND for {device.uuid}"
+                )
+                continue
             try:
                 df_line = format_response(create_device_found(device))
                 logger.info(f"[SEND] {client_ip}: {df_line.rstrip()}")

@@ -39,32 +39,71 @@ class _Connection:
     name: str
     message_buffer: str
     loop: asyncio.AbstractEventLoop
-    state: ConnectionState
     socket: _SocketConnection
     tasks: set[asyncio.Task]
 
     def __init__(
-        self, address: str, name: str, on_data_callback: Callable[[dict], None]
+        self,
+        address: str,
+        name: str,
+        on_data_callback: Callable[[dict], None],
+        on_state_change: Callable[[], None] | None = None,
     ) -> None:
         """Setup and start a socket connection."""
         self.address = address
         self.name = name
         self.loop = asyncio.get_running_loop()
-        self.state = ConnectionState.NOT_STARTED
+        self._state = ConnectionState.NOT_STARTED
         self.on_data_callback = on_data_callback
+        # DEVIATION (O5): fired on every state transition of this socket, so
+        # that "the connection just died" is something the caller is told
+        # rather than something it has to go and ask about on a timer. Assigned
+        # before init_run() so the first CONNECTED is not missed; _state is set
+        # directly above so constructing a connection does not itself announce
+        # a transition.
+        self.on_state_change = on_state_change
         self.message_buffer = ""
         self.socket = _SocketConnection(address, self.loop)
         self.tasks = set()
         self.init_run()
 
-    async def send_data(self, data_to_send: str) -> None:
-        """Send data to socket."""
+    @property
+    def state(self) -> ConnectionState:
+        """Return the current state of this socket."""
+        return self._state
+
+    @state.setter
+    def state(self, value: ConnectionState) -> None:
+        """Set the state, announcing real transitions.
+
+        DEVIATION (O5): every path that loses the socket -- a failed send, a
+        read error, and the FIN that read_socket() turns into ERROR -- runs
+        through here, so one hook covers all of them.
+        """
+        if value == self._state:
+            return
+        self._state = value
+        if self.on_state_change is not None:
+            try:
+                self.on_state_change()
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Connection state listener failed: %s", exc)
+
+    async def send_data(self, data_to_send: str) -> bool:
+        """Send data to socket, reporting whether it left the machine.
+
+        DEVIATION (O5): stock swallowed the failure and returned None, so a
+        command issued over a dead socket was indistinguishable from one that
+        was delivered. The caller needs to be able to tell.
+        """
         _LOGGER.debug("[%s] Sending data: %s", self.address, data_to_send)
         try:
             await self.socket.send_bytes(str.encode(data_to_send))
         except Exception as exc:  # pylint: disable=broad-exception-caught
             _LOGGER.error("Error sending data: %s", exc)
             self.state = ConnectionState.ERROR
+            return False
+        return True
 
     async def read_socket(self) -> None:
         """Read data from socket."""

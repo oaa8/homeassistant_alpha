@@ -70,6 +70,8 @@ def create_http_app(state: SimulatorState, config: Config, quirk_manager: QuirkM
         POST /api/control/disconnect - Disconnect active connection (T071)
         POST /api/control/refuse-connections - Enable/disable connection refusal (T071)
         POST /api/control/latency - Set connection latency (T071)
+        POST /api/control/withhold - Withhold devices from enumeration (#16)
+        POST /api/control/deliver/{uuid} - Deliver a withheld device late (#16)
     """
     # Order matters: logging_middleware runs first (outermost), then error_middleware
     app = Application(middlewares=[logging_middleware, error_middleware])
@@ -91,9 +93,12 @@ def create_http_app(state: SimulatorState, config: Config, quirk_manager: QuirkM
         web.post('/api/control/disconnect', disconnect_active_connection),
         web.post('/api/control/refuse-connections', set_refuse_connections),
         web.post('/api/control/latency', set_connection_latency),
+        # wayfinder #16 (O10): enumeration shortfall and late arrival
+        web.post('/api/control/withhold', set_withheld_devices),
+        web.post('/api/control/deliver/{uuid}', deliver_device_late),
     ])
     
-    logger.info("HTTP API application created with 9 routes")
+    logger.info("HTTP API application created with 11 routes")
     return app
 
 
@@ -685,6 +690,99 @@ async def set_connection_latency(request: Request) -> Response:
             {"error": f"Invalid request: {e}"},
             status=400
         )
+
+
+async def set_withheld_devices(request: Request) -> Response:
+    """
+    POST /api/control/withhold - Hold devices back from the DEVICE_FOUND stream.
+
+    Request: {"uuids": ["<uuid>", ...]}  (an empty list clears withholding)
+    Response: {"status": "ok", "withheld": ["<uuid>", ...]}
+
+    Purpose (wayfinder #16, outcome O10): produce an enumeration shortfall.
+    DEVICE_LIST still reports the full count; the withheld devices simply never
+    announce themselves, so the client is told to expect N and receives N-1.
+
+    This injects a missing message and nothing else. How the real hub reports a
+    switch that is registered but unreachable is an open question (wayfinder
+    #13) and is not being guessed at here.
+    """
+    state = request.app[STATE_KEY]
+    quirk_manager = request.app[QUIRK_KEY]
+
+    try:
+        data = await request.json()
+    except (ValueError, KeyError) as e:
+        return web.json_response({"error": f"Invalid request: {e}"}, status=400)
+
+    uuids = data.get("uuids", [])
+    if not isinstance(uuids, list) or not all(isinstance(u, str) for u in uuids):
+        return web.json_response(
+            {"error": "uuids must be a list of strings"},
+            status=400
+        )
+
+    unknown = [u for u in uuids if state.get_device(u) is None]
+    if unknown:
+        return web.json_response(
+            {"error": "not_found", "message": f"Unknown devices: {unknown}"},
+            status=404
+        )
+
+    quirk_manager.set_withheld_devices(set(uuids))
+
+    logger.info(f"[http] Control operation: withhold devices {sorted(uuids)}")
+
+    return web.json_response({"status": "ok", "withheld": sorted(uuids)})
+
+
+async def deliver_device_late(request: Request) -> Response:
+    """
+    POST /api/control/deliver/{uuid} - Announce a withheld device right now.
+
+    Response: {"status": "ok", "delivered": true, "was_withheld": true/false}
+
+    Purpose (wayfinder #16, outcome O10): the late DEVICE_FOUND. A device that
+    missed enumeration reports on its own, without the client asking again, and
+    the entity that was showing unavailable has to come back to life.
+
+    Stops withholding the device and writes a DEVICE_FOUND for it to the active
+    connection, in the same shape the enumeration stream uses.
+    """
+    from deako_simulator.protocol import create_device_found, format_response
+
+    state = request.app[STATE_KEY]
+    quirk_manager = request.app[QUIRK_KEY]
+    uuid = request.match_info['uuid']
+
+    device = state.get_device(uuid)
+    if device is None:
+        raise web.HTTPNotFound(
+            text='{"error": "not_found", "message": "Device not found"}',
+            content_type='application/json'
+        )
+
+    was_withheld = quirk_manager.release_device(uuid)
+
+    writer = state.active_connection
+    if writer is None or writer.is_closing():
+        return web.json_response({
+            "status": "ok",
+            "delivered": False,
+            "was_withheld": was_withheld,
+            "message": "no active connection to deliver on",
+        })
+
+    line = format_response(create_device_found(device))
+    logger.info(f"[http] Control operation: late DEVICE_FOUND for {uuid}")
+    writer.write(line.encode('utf-8'))
+    await writer.drain()
+
+    return web.json_response({
+        "status": "ok",
+        "delivered": True,
+        "was_withheld": was_withheld,
+    })
 
 
 async def start_http_api(

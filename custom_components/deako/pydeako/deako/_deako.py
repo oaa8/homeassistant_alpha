@@ -2,7 +2,7 @@
 import asyncio
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from ..models import ResponseType
 from ._manager import _Manager
@@ -22,6 +22,24 @@ class FindDevicesError(Exception):
         return f"Failed to find devices: {self.reason}"
 
 
+class DeviceCommandError(Exception):
+    """A command could not be delivered to the hub.
+
+    DEVIATION (O5): stock had no way to say this. control_device() awaited a
+    send that logged its own failure and returned nothing, so a command issued
+    while disconnected was swallowed -- the light appeared to accept it and
+    then did not move.
+    """
+
+    def __init__(self, reason: str = "unknown") -> None:
+        """Initialize with optional reason string."""
+        self.reason = reason
+        super().__init__()
+
+    def __str__(self):
+        return f"Failed to send command to the hub: {self.reason}"
+
+
 DEFAULT_DEVICE_LIST_TIMEOUT_S = 10
 DEVICE_LIST_POLLING_INTERVAL_S = 1
 DEVICE_FOUND_POLLING_INTERVAL_S = 1
@@ -29,16 +47,20 @@ DEVICE_FOUND_POLLING_INTERVAL_S = 1
 # DEVIATION (O1): a slow hub must not stop the lights from appearing.
 # Stock allowed DEVICE_FOUND_TIME_FACTOR_S = 2 seconds per expected device and
 # then raised, failing config entry setup outright -- no lights in Home
-# Assistant at all. That is replaced by one explicit, generous window for the
-# whole enumeration, and by continuing with whatever arrived (see find_devices).
+# Assistant at all. That is replaced by one explicit window for the whole
+# enumeration, and by continuing with whatever arrived (see find_devices).
 #
-# 60s is a defensible placeholder, not a measurement: it comfortably exceeds
-# the 2s x device count stock would have allowed for this house, and stays well
-# inside Home Assistant's 300s setup ceiling. It only ever elapses in full when
-# devices are genuinely missing, because the wait exits as soon as the expected
-# count is reached. Replace it with a measured value once the spare switch rig
-# has timed real enumeration.
-DEVICE_FOUND_WINDOW_S = 60
+# 15s, and no longer a guess: the spare switch rig timed the real hub
+# delivering all 37 devices in 487-705ms across repeated starts (wayfinder
+# #17), so this is twenty times the measured worst case. It replaces a 60s
+# placeholder, which only ever elapsed in full when a device was genuinely
+# missing -- and then stalled setup for a minute every time.
+#
+# Waiting less is also cheaper than it used to be. A straggler that arrives
+# after the window is no longer lost: its DEVICE_FOUND is announced and an
+# entity is built for it then (DEVIATION O10, record_device). The window now
+# decides how long the lights are late, not whether they appear.
+DEVICE_FOUND_WINDOW_S = 15
 
 CAPABILITY_DIMMABLE = "dim"
 
@@ -59,9 +81,55 @@ class Deako:
             # DEVIATION (O7): after a reconnect, Home Assistant must show
             # current state. See resync_devices.
             on_connect=self.resync_devices,
+            # DEVIATION (O5): pushed so a consumer can mark everything
+            # unavailable the moment the hub goes away, instead of serving
+            # cached state that stopped being true.
+            on_connection_change=self.notify_connection_listeners,
         )
         self.devices: dict[str, Any] = {}
         self.expected_devices = 0
+        # DEVIATION (O5): listeners for connection up/down.
+        self.connection_listeners: list[Callable[[bool], None]] = []
+        # DEVIATION (O10): fired when a device reports for the first time. A
+        # device that was silent during enumeration has no entity at all, so
+        # there is no per-device callback to reach -- this is how a late
+        # arrival gets one.
+        self.device_added_callback: Callable[[str], None] | None = None
+
+    def add_connection_listener(
+        self, listener: Callable[[bool], None],
+    ) -> None:
+        """Register a listener for connection up/down (DEVIATION, O5)."""
+        if listener not in self.connection_listeners:
+            self.connection_listeners.append(listener)
+
+    def remove_connection_listener(
+        self, listener: Callable[[bool], None],
+    ) -> None:
+        """Unregister a connection listener (DEVIATION, O5)."""
+        if listener in self.connection_listeners:
+            self.connection_listeners.remove(listener)
+
+    def notify_connection_listeners(self, connected: bool) -> None:
+        """Tell every listener the connection state changed (DEVIATION, O5).
+
+        One listener raising must not cost the others their notification --
+        that would leave part of the house looking healthy and part of it not.
+        """
+        for listener in list(self.connection_listeners):
+            try:
+                listener(connected)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Connection listener failed: %s", exc)
+
+    def set_device_added_callback(
+        self, callback: Callable[[str], None] | None,
+    ) -> None:
+        """Set the callback for a device reporting for the first time.
+
+        DEVIATION (O10): see device_added_callback.
+        """
+        self.device_added_callback = callback
 
     def update_state(
         self, uuid: str, power: bool, dim: int | None = None,
@@ -124,7 +192,12 @@ class Deako:
         power: bool, dim: int | None = None,
     ) -> None:
         """Store a device in local memory."""
-        if uuid not in self.devices:
+        # DEVIATION (O10): a device that missed enumeration is visible, not
+        # silently absent -- and it has to be able to come back. Whether this
+        # is the first time we have heard of it decides which callback below
+        # can carry the news, so it is answered before the write.
+        is_new = uuid not in self.devices
+        if is_new:
             self.devices[uuid] = {"state": {}}
 
         self.devices[uuid]["name"] = name
@@ -140,6 +213,15 @@ class Deako:
         callback = self.devices[uuid].get("callback")
         if callback is not None:
             callback()
+
+        # DEVIATION (O10): a first-time device has no per-device callback yet,
+        # because nothing has been built to listen for it. Announce it so one
+        # can be created -- this is the late DEVICE_FOUND arriving.
+        if is_new and self.device_added_callback is not None:
+            try:
+                self.device_added_callback(uuid)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Device added callback failed: %s", exc)
 
     async def connect(self) -> None:
         """Initiate the connection sequence."""
@@ -239,14 +321,25 @@ class Deako:
     async def control_device(
         self, uuid: str, power: bool, dim: int | None = None
     ) -> None:
-        """Add control request to queue."""
+        """Send a state change to the hub.
+
+        DEVIATION (O5): commands issued while disconnected must fail visibly.
+        Stock awaited a send whose failure only ever reached a log line, so the
+        light took the command, reported nothing wrong, and did not move.
+        """
 
         def completed_callback():
             self.update_state(uuid, power, dim)
 
-        await self.connection_manager.send_state_change(
+        sent = await self.connection_manager.send_state_change(
             uuid, power, dim, completed_callback=completed_callback
         )
+        if not sent:
+            raise DeviceCommandError(
+                "no live connection to the hub"
+                if not self.is_connected()
+                else "the hub did not accept the command"
+            )
 
     def get_name(self, uuid: str) -> str | None:
         """Get a device's name by uuid."""

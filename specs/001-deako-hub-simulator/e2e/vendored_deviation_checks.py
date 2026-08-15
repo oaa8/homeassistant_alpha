@@ -44,7 +44,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import pydeako  # noqa: E402
 from pydeako.deako import _deako as deako_module  # noqa: E402
-from pydeako.deako import Deako, FindDevicesError  # noqa: E402
+from pydeako.deako import Deako, DeviceCommandError, FindDevicesError  # noqa: E402
 from pydeako.deako._manager import _Manager  # noqa: E402
 from pydeako.models import ResponseType, device_ping_request  # noqa: E402
 
@@ -87,11 +87,18 @@ class _StubManager:
 
     def __init__(self, send_ok: bool = True) -> None:
         self.device_list_requests = 0
+        self.state_changes = 0
         self.send_ok = send_ok
         self.connected = False
 
     async def send_get_device_list(self) -> bool:
         self.device_list_requests += 1
+        return self.send_ok
+
+    async def send_state_change(
+        self, uuid, power, dim=None, completed_callback=None,
+    ) -> bool:
+        self.state_changes += 1
         return self.send_ok
 
     def is_connected(self) -> bool:
@@ -166,9 +173,14 @@ async def offline_checks() -> None:
     class _InstantConnection:
         """A _Connection that is connected the moment it is built."""
 
-        def __init__(self, address, name, _callback) -> None:
+        def __init__(self, address, name, _callback, on_state_change=None) -> None:
             self.address = address
             self.name = name
+            self.on_state_change = on_state_change
+            # _Manager.is_connected() reaches through to the raw socket, since
+            # _Connection.close() does not move the state machine out of
+            # CONNECTED (DEVIATION O5).
+            self.socket = type("_Sock", (), {"sock": object()})()
 
         def is_connected(self) -> bool:
             return True
@@ -284,6 +296,111 @@ async def offline_checks() -> None:
         "O5 Deako exposes an honest connection-state accessor",
         down is False and up is True,
         f"reported {down} when down and {up} when up",
+    )
+
+    # Asking is not enough on its own -- nothing must have to poll for it.
+    deako, manager = _stub_deako()
+    seen: list[bool] = []
+    deako.add_connection_listener(seen.append)
+    deako.notify_connection_listeners(False)
+    deako.notify_connection_listeners(True)
+    deako.remove_connection_listener(seen.append)
+    check(
+        "O5 connection changes are pushed to listeners",
+        seen == [False, True],
+        f"listener saw {seen}",
+    )
+
+    # One listener blowing up must not cost the others their notification;
+    # otherwise half the house would keep looking healthy.
+    deako, manager = _stub_deako()
+    survivors: list[bool] = []
+
+    def _explode(_connected: bool) -> None:
+        raise RuntimeError("listener is broken")
+
+    deako.add_connection_listener(_explode)
+    deako.add_connection_listener(survivors.append)
+    deako.notify_connection_listeners(True)
+    check(
+        "O5 a broken listener does not silence the others",
+        survivors == [True],
+        f"surviving listener saw {survivors}",
+    )
+
+    # The manager only announces real transitions, and announces them from
+    # every path that loses the socket.
+    manager = _Manager(lambda: None, lambda _json: None, on_connection_change=None)
+    announced: list[bool] = []
+    manager.on_connection_change = announced.append
+    manager.connection = type(
+        "_Live", (), {
+            "is_connected": lambda self: True,
+            "socket": type("_Sock", (), {"sock": object()})(),
+            "close": lambda self: None,
+        },
+    )()
+    manager.notify_connection_change()
+    manager.notify_connection_change()  # no change; must stay quiet
+    manager.close()
+    check(
+        "O5 the manager announces transitions once, including on close()",
+        announced == [True, False],
+        f"announcements={announced} (close() is how the watchdog drops a "
+        "blackholed connection)",
+    )
+
+    # -- O5: commands must not be swallowed ----------------------------------
+    deako, manager = _stub_deako(send_ok=False)
+    manager.connected = False
+    deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+    try:
+        await deako.control_device(DIMMABLE_UUID, True, 50)
+        raised = None
+    except DeviceCommandError as exc:
+        raised = exc
+    check(
+        "O5 a command that could not be sent raises instead of returning",
+        raised is not None,
+        f"raised={raised!r} (stock awaited a send whose failure only ever "
+        "reached a log line, so the light took the command and did not move)",
+    )
+
+    deako, manager = _stub_deako(send_ok=True)
+    manager.connected = True
+    deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+    try:
+        await deako.control_device(DIMMABLE_UUID, True, 50)
+        raised = None
+    except DeviceCommandError as exc:
+        raised = exc
+    check(
+        "O5 a command that was sent does not raise",
+        raised is None and manager.state_changes == 1,
+        f"raised={raised!r}, sends={manager.state_changes}",
+    )
+
+    # -- O10: a device that missed enumeration can still turn up -------------
+    deako, _ = _stub_deako()
+    announced_devices: list[str] = []
+    deako.set_device_added_callback(announced_devices.append)
+    deako.record_device("Late switch", NON_DIMMABLE_UUID, False, False, None)
+    first_time = list(announced_devices)
+    deako.record_device("Late switch", NON_DIMMABLE_UUID, False, True, None)
+    check(
+        "O10 a first-time DEVICE_FOUND is announced, a repeat is not",
+        first_time == [NON_DIMMABLE_UUID] and announced_devices == first_time,
+        f"announced={announced_devices} (the repeat goes to the device's own "
+        "callback, which already exists)",
+    )
+
+    deako, _ = _stub_deako()
+    deako.set_device_added_callback(None)
+    deako.record_device("Late switch", NON_DIMMABLE_UUID, False, False, None)
+    check(
+        "O10 no listener is not an error",
+        NON_DIMMABLE_UUID in deako.get_devices(),
+        "the device is still recorded when nothing is listening",
     )
 
 
