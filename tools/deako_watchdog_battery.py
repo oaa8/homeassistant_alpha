@@ -943,6 +943,159 @@ async def phase_payload_variants(
     )
 
 
+async def phase_separators(
+    host: str, port: int, probe_name: str, journal: Journal, gap: float = 0.6
+) -> None:
+    """Is the delimiter wrong, rather than the idea?
+
+    The `payload` phase concluded that the hub matches the *leading* uuid and
+    ignores the rest -- but every observation behind that used a **comma**, and
+    `"<uuid>ZZZZ"` already showed that trailing junk after a valid id is
+    tolerated. So a space- or semicolon-separated list would have produced
+    exactly the same readings. "No multi-target" and "wrong delimiter" are not
+    distinguished by anything measured so far.
+
+    The discriminator is **bogus-first**: put an id that cannot exist in front
+    of the real one. If the hub only ever reads the leading token it answers
+    REQUEST_INVALID and nothing moves, whatever the separator. If some
+    separator is the real one, the hub scans past the bad id and the probe
+    device moves -- and the dim value names which separator did it.
+
+    One probe per separator rather than a pair, because bogus-first alone
+    settles it, which keeps the whole sweep inside a short window.
+    """
+    import uuid as uuid_mod
+
+    BOGUS = "00000000-0000-4000-8000-000000000000"
+    # dim doubles as a label: whichever value the device lands on names the
+    # separator that worked.
+    separators: list[tuple[str, str, int]] = [
+        ("space", " ", 41),
+        ("semicolon", ";", 43),
+        ("pipe", "|", 47),
+        ("plus", "+", 49),
+        ("ampersand", "&", 51),
+        ("comma+space", ", ", 53),
+        ("tab", "\t", 57),
+        ("colon", ":", 59),
+    ]
+
+    reader = writer = None
+    for attempt in range(1, 6):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=10.0
+            )
+            break
+        except (OSError, asyncio.TimeoutError) as exc:
+            journal.note(f"separators: connect attempt {attempt} failed ({exc})")
+            await asyncio.sleep(2.0)
+    if reader is None or writer is None:
+        journal.record("separators", error="could not connect")
+        return
+
+    sent: dict[str, str] = {}
+    replies: dict[str, list[dict[str, Any]]] = {}
+    moved: list[dict[str, Any]] = []
+    probe_uuid: str | None = None
+
+    async def send(tag: str, message: dict[str, Any]) -> None:
+        tid = str(uuid_mod.uuid4())
+        message["transactionId"] = tid
+        message.setdefault("src", CLIENT_NAME)
+        message.setdefault("dst", "deako")
+        sent[tid] = tag
+        writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\r\n")
+        await writer.drain()
+
+    async def drain(seconds: float) -> bool:
+        nonlocal probe_uuid
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=deadline - time.monotonic()
+                )
+            except asyncio.TimeoutError:
+                return True
+            if not line:
+                return False
+            try:
+                msg = json.loads(line.decode(errors="replace").strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            tag = sent.get(msg.get("transactionId"))
+            data = msg.get("data") or {}
+            if tag:
+                replies.setdefault(tag, []).append(msg)
+            elif msg.get("type") == "EVENT" and probe_uuid and data.get(
+                "target"
+            ) == probe_uuid:
+                moved.append(data.get("state"))
+            elif probe_uuid is None and msg.get("type") == "DEVICE_FOUND":
+                if str(data.get("name", "")).strip().lower() == probe_name.strip().lower():
+                    probe_uuid = data.get("uuid")
+        return True
+
+    try:
+        await send("device_list", {"type": "DEVICE_LIST"})
+        await drain(6.0)
+        if probe_uuid is None:
+            journal.record("separators", error=f"probe device {probe_name!r} not found")
+            return
+
+        outcomes: dict[str, Any] = {}
+        for name, sep, dim in separators:
+            before = len(moved)
+            await send(
+                name,
+                {
+                    "type": "CONTROL",
+                    "data": {
+                        "target": f"{BOGUS}{sep}{probe_uuid}",
+                        "state": {"power": True, "dim": dim},
+                    },
+                },
+            )
+            # The confirming EVENT lands ~2.4s after the ack.
+            if not await drain(max(gap * 2, 4.0)):
+                outcomes[name] = {"verdict": "connection died"}
+                break
+            reply = (replies.get(name) or [None])[0]
+            actuated = len(moved) > before
+            outcomes[name] = {
+                "reply": (reply or {}).get("status"),
+                "code": ((reply or {}).get("data") or {}).get("code"),
+                "device_moved": actuated,
+                "verdict": (
+                    "SEPARATOR WORKS -- hub scanned past the leading id"
+                    if actuated
+                    else "leading id only"
+                ),
+            }
+
+        # Closing bracket: a known-good single-target command, so the negatives
+        # above are only trusted if the hub was still answering at the end.
+        await send("bracket_close", {
+            "type": "CONTROL",
+            "data": {"target": probe_uuid, "state": {"power": True, "dim": 45}},
+        })
+        await drain(max(gap * 3, 5.0))
+
+        journal.record(
+            "separators",
+            method="bogus-first per separator; the hub must scan past a "
+            "non-existent leading id for a separator to be real",
+            outcomes=outcomes,
+            negatives_trustworthy=bool(replies.get("bracket_close")),
+            probe_device_events=moved,
+        )
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+
+
 async def phase_enumerate(client: Deako, journal: Journal) -> dict[str, Any]:
     """Time a full enumeration through the library, not the raw socket."""
     start = time.monotonic()
@@ -1276,6 +1429,15 @@ async def run(args: argparse.Namespace) -> int:
             except (OSError, asyncio.TimeoutError) as exc:
                 journal.record("payload_variants", error=str(exc))
 
+        if "separators" in phases:
+            journal.note("--- phase separators ---")
+            try:
+                await phase_separators(
+                    hub_host, hub_port, args.probe_device, journal
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                journal.record("separators", error=str(exc))
+
         needs_hub = phases & {"enumerate", "blackhole", "fin", "reset", "restart"}
         if needs_hub:
             await proxy.start()
@@ -1360,6 +1522,7 @@ ALL_PHASES = [
     "pong",
     "scene",
     "payload",
+    "separators",
     "enumerate",
     "blackhole",
     "fin",
