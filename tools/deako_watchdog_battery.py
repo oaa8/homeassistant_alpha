@@ -799,7 +799,10 @@ async def phase_payload_variants(
 
             if variant is not None:
                 await send("variant", variant)
-                alive = await drain(gap * 2)
+                # The confirming EVENT lands ~2.4 s after the acknowledgment
+                # (#17), so a short drain reads as "nothing moved" when the
+                # truth is "not yet". Wait long enough to see it.
+                alive = await drain(max(gap * 2, 5.0))
 
             await send("close", bracket(38))
             alive = await drain(gap * 4) and alive
@@ -822,12 +825,41 @@ async def phase_payload_variants(
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
 
+    async def attempt(label: str, variant: dict[str, Any] | None) -> dict[str, Any]:
+        """Run one probe, retrying transport failures.
+
+        A freshly woken node resets the first connection -- measured twice in
+        #19, and it cost this probe an entire window when it was not handled
+        here. A reset before the variant is sent says nothing about the
+        variant, so it must be retried rather than recorded.
+        """
+        last: dict[str, Any] = {}
+        for tries in range(1, 5):
+            try:
+                result = await one_connection(label, variant)
+            except (OSError, asyncio.TimeoutError) as exc:
+                # Only a reset *after* the variant was sent is evidence about
+                # the variant. Before that, it is just a cold node.
+                if variant is not None and probe_uuid is not None:
+                    return {
+                        "verdict": "KILLED THE CONNECTION",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "attempts": tries,
+                    }
+                last = {"error": f"{type(exc).__name__}: {exc}"}
+                await asyncio.sleep(2.0)
+                continue
+            if result.get("error") and probe_uuid is None:
+                last = result
+                await asyncio.sleep(2.0)
+                continue
+            result["attempts"] = tries
+            return result
+        return last or {"error": "exhausted retries"}
+
     # A control run with no variant at all, proving the rig itself does not
     # kill connections -- otherwise a kill proves nothing.
-    try:
-        outcomes["control_no_variant"] = await one_connection("control", None)
-    except (OSError, asyncio.TimeoutError) as exc:
-        outcomes["control_no_variant"] = {"error": str(exc)}
+    outcomes["control_no_variant"] = await attempt("control", None)
 
     variants = [
         (
@@ -865,15 +897,41 @@ async def phase_payload_variants(
                 "data": {"target": f"{u},{u}", "state": {"power": True, "dim": 58}},
             },
         ),
+        # The decisive experiment. Both csv and a corrupted id returned ok AND
+        # moved the device, which is consistent with the hub matching the
+        # *leading* uuid and ignoring the rest. If that is what it does, a csv
+        # target is a single-target command wearing a disguise, and no second
+        # light is ever addressed.
+        #
+        # Real-first should move the probe device; bogus-first should not.
+        # Neither form can touch a second real light, so this settles
+        # multi-target semantics without actuating anything else.
+        (
+            "target=real,bogus",
+            lambda u: {
+                "type": "CONTROL",
+                "data": {
+                    "target": f"{u},00000000-0000-4000-8000-000000000000",
+                    "state": {"power": True, "dim": 63},
+                },
+            },
+        ),
+        (
+            "target=bogus,real",
+            lambda u: {
+                "type": "CONTROL",
+                "data": {
+                    "target": f"00000000-0000-4000-8000-000000000000,{u}",
+                    "state": {"power": True, "dim": 67},
+                },
+            },
+        ),
     ]
     for label, build in variants:
         if probe_uuid is None:
             outcomes[label] = {"error": "no probe uuid"}
             continue
-        try:
-            outcomes[label] = await one_connection(label, build(probe_uuid))
-        except (OSError, asyncio.TimeoutError) as exc:
-            outcomes[label] = {"verdict": "KILLED THE CONNECTION", "error": str(exc)}
+        outcomes[label] = await attempt(label, build(probe_uuid))
         await asyncio.sleep(0.5)
 
     journal.record(
