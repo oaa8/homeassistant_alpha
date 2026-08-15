@@ -297,6 +297,31 @@ async def cmd_control(conn_factory: Callable[[], DeakoConnection], args) -> int:
     return 0
 
 
+async def cmd_raw(conn_factory: Callable[[], DeakoConnection], args) -> int:
+    """Send arbitrary JSON messages on one connection, capturing each reply.
+
+    Used to probe for protocol forms the published documentation does not
+    describe. Messages are sent over a single connection because reconnecting
+    between probes is both slow and, on a node that sheds its network presence
+    when idle, unreliable.
+
+    ``transactionId``/``src``/``dst`` are filled in only when absent, so a probe
+    can deliberately omit or malform them.
+    """
+    async with conn_factory() as conn:
+        for index, blob in enumerate(args.send, 1):
+            try:
+                message = json.loads(blob)
+            except (json.JSONDecodeError, ValueError) as exc:
+                conn.capture.note(f"probe {index}: not valid JSON ({exc}); sending verbatim")
+                await conn.send_raw(blob + "\r\n")
+            else:
+                conn.capture.note(f"probe {index}/{len(args.send)}")
+                await conn.send(message)
+            await conn.read_lines(args.wait)
+    return 0
+
+
 async def wait_for_node(host: str, port: int, timeout: float, capture: Capture) -> bool:
     """Block until the node accepts a connection, so a restart can be measured.
 
@@ -367,6 +392,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctl.add_argument("--dim", type=float)
     p_ctl.add_argument("--wait", type=float, default=10.0)
     p_ctl.set_defaults(func=cmd_control)
+
+    p_raw = sub.add_parser("raw", help="send arbitrary JSON probes on one connection")
+    p_raw.add_argument(
+        "--send",
+        action="append",
+        required=True,
+        metavar="JSON",
+        help="a message to send; repeat for a sequence",
+    )
+    p_raw.add_argument("--wait", type=float, default=6.0, help="seconds to listen after each")
+    p_raw.set_defaults(func=cmd_raw)
 
     return parser
 
