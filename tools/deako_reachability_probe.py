@@ -554,6 +554,59 @@ async def sweep_race(
     return result
 
 
+async def witness(
+    session: Session, suspect: str, control: str, watch: float = 8.0
+) -> dict[str, Any]:
+    """Command two devices and see which one's change is witnessed.
+
+    This is the whole question in one phase. A `CONTROL` is acknowledged locally
+    within ~100 ms whatever happens, so the acknowledgement proves nothing; only
+    the trailing `EVENT` shows something real moved. Run against a device
+    believed to be physically gone and a device known to be live, it does two
+    jobs at once: it identifies the specimen, and it tests whether the detector
+    this map intends to ship can actually tell them apart.
+
+    The suspect is commanded **off** deliberately. Echoing its cached state back
+    would be the idempotent choice, but that cache says `power: true`, so if the
+    switch turns out to be live and currently off, the "harmless" probe would
+    switch a light on in someone's house.
+    """
+    outcomes: dict[str, Any] = {}
+    for role, target, state in (
+        ("suspect", suspect, {"power": False}),
+        ("control", control, {"power": True}),
+    ):
+        start = len(session.messages)
+        result = await session.request(
+            {"type": "CONTROL", "data": {"target": target, "state": state}},
+            timeout=watch,
+        )
+        event_ms = None
+        deadline = time.monotonic() + watch
+        index = start
+        while time.monotonic() < deadline and event_ms is None:
+            while index < len(session.messages):
+                offset, msg = session.messages[index]
+                index += 1
+                if msg.get("type") == "EVENT" and (msg.get("data") or {}).get("target") == target:
+                    event_ms = round(offset, 1)
+                    break
+            await asyncio.sleep(0.05)
+        outcomes[role] = {
+            "uuid": target,
+            "commanded": state,
+            "acknowledged": result["answered"],
+            "ack_ms": result["latency_ms"],
+            "event_witnessed": event_ms is not None,
+        }
+        await asyncio.sleep(1.0)
+    outcomes["discriminates"] = (
+        outcomes["control"]["event_witnessed"] and not outcomes["suspect"]["event_witnessed"]
+    )
+    session.journal.record("witness", **outcomes)
+    return outcomes
+
+
 async def run(args: argparse.Namespace, journal: Journal) -> int:
     if args.wait_for_node and not await wait_for_node(
         args.host, args.port, args.wait_for_node, journal
@@ -633,6 +686,12 @@ async def run(args: argparse.Namespace, journal: Journal) -> int:
             )
             await sweep_race(session, known, args.sweep_race_seconds)
 
+        if args.witness and args.suspect:
+            journal.note(
+                f"witness test: commanding suspect {args.suspect} and control {known}"
+            )
+            await witness(session, args.suspect, args.control_uuid or known)
+
         if args.control:
             state = dict(devices[known]["state"] or {})
             await control_and_event(session, known, state)
@@ -706,6 +765,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="poll --target continuously for this long while it is driven out of "
         "band, to see whether the poll leads or follows the mesh EVENT",
+    )
+    parser.add_argument(
+        "--witness",
+        action="store_true",
+        help="command --suspect and a control device, and record which change is "
+        "witnessed by an EVENT (moves real lights)",
     )
     parser.add_argument(
         "--sweep-race-seconds",
