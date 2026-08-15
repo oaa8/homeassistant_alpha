@@ -438,6 +438,62 @@ async def duel(
     return result
 
 
+async def watch(
+    session: Session, target: str, seconds: float, interval: float = 0.25
+) -> dict[str, Any]:
+    """Poll one device continuously and record when its answer changes.
+
+    This is what separates a poll that reaches the device from one answered out
+    of the node's own profile. The device is driven out of band, through a
+    different hub, while this runs. A poll that reports the new state *before*
+    the mesh EVENT announcing it must have asked the device; a poll that only
+    changes once the EVENT lands was reading what the EVENT wrote.
+    """
+    samples: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    seen = len(session.messages)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        outcome = await session.request(
+            {"type": "DEVICE_POLL", "target": target}, timeout=2.0
+        )
+        reply = outcome.get("reply") or {}
+        data = reply.get("data") if isinstance(reply.get("data"), dict) else {}
+        state = data.get("state") if isinstance(data.get("state"), dict) else None
+        samples.append(
+            {
+                "at_ms": round(session.journal.offset_ms(), 1),
+                "answered": outcome["answered"],
+                "latency_ms": outcome["latency_ms"],
+                "state": state,
+            }
+        )
+        while seen < len(session.messages):
+            offset, msg = session.messages[seen]
+            seen += 1
+            if msg.get("type") == "EVENT" and (msg.get("data") or {}).get("target") == target:
+                events.append({"at_ms": round(offset, 1), "state": msg["data"].get("state")})
+        await asyncio.sleep(interval)
+
+    transitions = []
+    previous = None
+    for sample in samples:
+        current = sample["state"]
+        if current is not None and current != previous:
+            if previous is not None:
+                transitions.append({"at_ms": sample["at_ms"], "from": previous, "to": current})
+            previous = current
+    result = {
+        "target": target,
+        "polls": len(samples),
+        "answered": sum(1 for s in samples if s["answered"]),
+        "poll_transitions": transitions,
+        "events": events,
+    }
+    session.journal.record("watch", **result)
+    return result
+
+
 async def run(args: argparse.Namespace, journal: Journal) -> int:
     if args.wait_for_node and not await wait_for_node(
         args.host, args.port, args.wait_for_node, journal
@@ -502,6 +558,13 @@ async def run(args: argparse.Namespace, journal: Journal) -> int:
         if working_shape and args.suspect:
             control = args.control_uuid or known
             await duel(session, args.suspect, control, args.duel_repeats, shape=working_shape)
+
+        if working_shape and args.watch_seconds:
+            journal.note(
+                f"watching {devices[known]['name']!r} for {args.watch_seconds}s "
+                "-- drive it out of band now"
+            )
+            await watch(session, known, args.watch_seconds)
 
         if args.control:
             state = dict(devices[known]["state"] or {})
@@ -570,6 +633,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="the known-good device to compare the suspect against (default: --target)",
     )
     parser.add_argument("--duel-repeats", type=int, default=10)
+    parser.add_argument(
+        "--watch-seconds",
+        type=float,
+        default=0,
+        help="poll --target continuously for this long while it is driven out of "
+        "band, to see whether the poll leads or follows the mesh EVENT",
+    )
     return parser
 
 
