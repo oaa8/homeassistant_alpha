@@ -157,6 +157,54 @@ async def offline_checks() -> None:
         "so it fires on reconnects, not just the first connect",
     )
 
+    # The first connection must NOT resync -- the caller's find_devices() is
+    # about to enumerate anyway, and firing both sent two full DEVICE_LIST
+    # requests 38ms apart at every setup. Drive init_connection for real, with
+    # the socket layer stubbed out, rather than asserting the bookkeeping.
+    from pydeako.deako import _manager as manager_module
+
+    class _InstantConnection:
+        """A _Connection that is connected the moment it is built."""
+
+        def __init__(self, address, name, _callback) -> None:
+            self.address = address
+            self.name = name
+
+        def is_connected(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            pass
+
+    resyncs: list[int] = []
+
+    async def _count_resync() -> None:
+        resyncs.append(1)
+
+    async def _address() -> tuple[str, str]:
+        return "127.0.0.1:8023", "stub"
+
+    real_connection = manager_module._Connection
+    manager_module._Connection = _InstantConnection
+    try:
+        manager = _Manager(_address, lambda _json: None, on_connect=_count_resync)
+        await manager.init_connection()
+        after_first = len(resyncs)
+        manager.maintain_worker.cancel()
+        manager.maintain_worker = None
+        await manager.init_connection()
+        after_second = len(resyncs)
+        manager.maintain_worker.cancel()
+    finally:
+        manager_module._Connection = real_connection
+
+    check(
+        "O7 the first connect does not resync, the second does",
+        after_first == 0 and after_second == 1,
+        f"resyncs after first connect={after_first}, after reconnect={after_second} "
+        "(firing on both made every setup enumerate twice)",
+    )
+
     # -- O1: enumeration window ---------------------------------------------
     check(
         "O1 the enumeration window is a named constant, not 2s per device",

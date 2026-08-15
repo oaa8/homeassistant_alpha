@@ -63,9 +63,12 @@ class _Manager:
         self.tasks = set()
         self.client_name = client_name
         self.state = _ManagerState()
-        # DEVIATION (O7): fired every time a connection is established,
-        # including reconnects, so cached state can be resynced.
+        # DEVIATION (O7): fired when a connection is *re*established, so cached
+        # state can be resynced. Not on the first connection: the caller
+        # enumerates with find_devices() immediately after connect(), and
+        # firing here as well made every setup request the device list twice.
         self.on_connect = on_connect
+        self.has_connected_before = False
 
     async def init_connection(self) -> None:
         """Initialize the connection process."""
@@ -104,7 +107,15 @@ class _Manager:
         # what the state is now, so a change made during an outage could stay
         # wrong indefinitely. Fired after the connection is live and
         # `connecting` is cleared, so the callback can send immediately.
-        if self.on_connect is not None:
+        #
+        # Skipped on the very first connection, where the caller's own
+        # find_devices() does the enumerating. Firing on both was observed
+        # sending two full DEVICE_LIST requests 38ms apart at every setup --
+        # harmless, since devices are keyed by uuid, but it doubles the
+        # enumeration burst on a hub with three dozen devices for nothing.
+        was_reconnect = self.has_connected_before
+        self.has_connected_before = True
+        if was_reconnect and self.on_connect is not None:
             await self.on_connect()
 
     def is_connected(self) -> bool:
