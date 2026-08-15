@@ -1,13 +1,38 @@
 {
   "config": {
     "step": {
-      "confirm": {
-        "description": "[%key:common::config_flow::description::confirm_setup%]"
+      "user": {
+        "title": "Connect to a Deako switch",
+        "description": "Enter the address of the Deako switch to connect to. This integration never picks a switch for you: only the address you enter here is used.",
+        "data": {
+          "ip_address": "IP address or host name",
+          "port": "Port"
+        }
       }
     },
+    "error": {
+      "invalid_host": "That is not a valid IPv4 address or host name. Enter the address only, without a port or a scheme.",
+      "invalid_port": "The port has to be a whole number between 1 and 65535."
+    },
     "abort": {
-      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]",
-      "no_devices_found": "[%key:common::config_flow::abort::no_devices_found%]"
+      "already_configured": "A Deako switch at that address is already set up."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Deako switch address",
+        "description": "Change the address of the Deako switch to connect to. Saving reconnects the integration.",
+        "data": {
+          "ip_address": "IP address or host name",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "invalid_host": "That is not a valid IPv4 address or host name. Enter the address only, without a port or a scheme.",
+      "invalid_port": "The port has to be a whole number between 1 and 65535.",
+      "already_configured": "A Deako switch at that address is already set up."
     }
   }
 }
