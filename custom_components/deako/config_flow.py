@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-from pydeako.discover import DeakoDiscoverer, DevicesNotFoundException
+from .pydeako.discover import DeakoDiscoverer, DevicesNotFoundException
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -13,7 +13,6 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import DOMAIN, NAME
-from ..deako import TELNET_MESSAGE_DELAY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,12 +59,6 @@ class DeakoOptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Required(
                         CONF_PORT, default=self.config_entry.options.get(CONF_PORT, 23)
                     ): int,
-                    vol.Optional(
-                        TELNET_MESSAGE_DELAY,
-                        default=self.config_entry.options.get(
-                            TELNET_MESSAGE_DELAY, 0.1
-                        ),
-                    ): float,
                 }
             ),
             errors=errors,

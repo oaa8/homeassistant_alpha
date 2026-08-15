@@ -5,7 +5,7 @@
 # configured by hand.
 set -e
 
-REPO="/mnt/c/Users/tolaa/Source/Repos/copilot-worktrees/homeassistant_alpha/oaa8-improved-enigma"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 HA_DIR="$HOME/ha-test-latest"
 VENV="$HOME/ha-venv-latest"
 
