@@ -494,6 +494,66 @@ async def watch(
     return result
 
 
+async def sweep_race(
+    session: Session, target: str, seconds: float
+) -> dict[str, Any]:
+    """Run sweeps back to back while one device is driven out of band.
+
+    The same experiment the watch phase runs against ``DEVICE_POLL``, but
+    against ``DEVICE_LIST`` — because the two verbs cannot be assumed to share a
+    source. If a ``DEVICE_FOUND`` reports the new state *before* the ``EVENT``
+    announcing it, the sweep asked the device and a missing device means an
+    unreachable one. If every sweep only changes after the ``EVENT``, the sweep
+    is reading the same profile the events maintain, and omission can never
+    happen.
+    """
+    samples: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    seen = len(session.messages)
+    deadline = time.monotonic() + seconds
+    round_index = 0
+    while time.monotonic() < deadline:
+        round_index += 1
+        result = await sweep(session, f"race{round_index}", timeout=4.0)
+        device = result["devices"].get(target)
+        samples.append(
+            {
+                "at_ms": round(session.journal.offset_ms(), 1),
+                "received": result["received"],
+                "advertised": result["advertised"],
+                "state": device["state"] if device else None,
+                "present": device is not None,
+            }
+        )
+        while seen < len(session.messages):
+            offset, msg = session.messages[seen]
+            seen += 1
+            if msg.get("type") == "EVENT" and (msg.get("data") or {}).get("target") == target:
+                events.append({"at_ms": round(offset, 1), "state": msg["data"].get("state")})
+        await asyncio.sleep(0.1)
+
+    transitions = []
+    previous = None
+    for s in samples:
+        current = s["state"]
+        if current is not None and current != previous:
+            if previous is not None:
+                transitions.append({"at_ms": s["at_ms"], "from": previous, "to": current})
+            previous = current
+    result = {
+        "target": target,
+        "sweeps": len(samples),
+        "always_complete": all(
+            s["advertised"] is not None and s["received"] >= s["advertised"] for s in samples
+        ),
+        "ever_absent": any(not s["present"] for s in samples),
+        "sweep_transitions": transitions,
+        "events": events,
+    }
+    session.journal.record("sweep_race", **result)
+    return result
+
+
 async def run(args: argparse.Namespace, journal: Journal) -> int:
     if args.wait_for_node and not await wait_for_node(
         args.host, args.port, args.wait_for_node, journal
@@ -565,6 +625,13 @@ async def run(args: argparse.Namespace, journal: Journal) -> int:
                 "-- drive it out of band now"
             )
             await watch(session, known, args.watch_seconds)
+
+        if args.sweep_race_seconds:
+            journal.note(
+                f"racing sweeps against {devices[known]['name']!r} for "
+                f"{args.sweep_race_seconds}s -- drive it out of band now"
+            )
+            await sweep_race(session, known, args.sweep_race_seconds)
 
         if args.control:
             state = dict(devices[known]["state"] or {})
@@ -639,6 +706,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="poll --target continuously for this long while it is driven out of "
         "band, to see whether the poll leads or follows the mesh EVENT",
+    )
+    parser.add_argument(
+        "--sweep-race-seconds",
+        type=float,
+        default=0,
+        help="run DEVICE_LIST sweeps back to back while --target is driven out of "
+        "band, to see whether the sweep leads or follows the mesh EVENT",
     )
     return parser
 
