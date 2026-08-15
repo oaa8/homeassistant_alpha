@@ -58,7 +58,8 @@ from deako_simulator.server import DeakoSimulator
 from deako_simulator.state import SimulatorState
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = REPO_ROOT / "custom_components" / "deako" / "manifest.json"
+INTEGRATION_DIR = REPO_ROOT / "custom_components" / "deako"
+MANIFEST_PATH = INTEGRATION_DIR / "manifest.json"
 
 
 @pytest.fixture
@@ -169,30 +170,41 @@ class TestManifest:
         assert manifest["domain"] == "deako"
         assert manifest.get("config_flow") is True
 
-    def test_manifest_requires_pydeako(self):
-        """Requirements are pinned strings, so membership must be a prefix check.
+    def test_manifest_has_no_requirements(self):
+        """pydeako is vendored, so the manifest must not install it.
 
-        An earlier revision asserted `"pydeako" in manifest["requirements"]`,
-        which is exact-match list membership against entries like
-        "pydeako==0.3.1" and is therefore always False.
+        An earlier revision asserted the opposite -- that requirements included
+        a pinned "pydeako==..." -- which was right while the library came from
+        PyPI. The library is now a thin in-repo copy at
+        custom_components/deako/pydeako, so a requirement would install a second,
+        different pydeako alongside the one actually imported.
         """
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
         requirements = manifest["requirements"]
-        assert any(r.startswith("pydeako") for r in requirements), (
-            f"Integration must depend on pydeako; got {requirements}"
+        assert requirements == [], (
+            f"The vendored library must be the only pydeako; got {requirements}"
         )
+        assert (
+            INTEGRATION_DIR / "pydeako" / "deako" / "_deako.py"
+        ).exists(), "The vendored pydeako copy the manifest relies on is missing"
 
-    def test_manifest_zeroconf_matches_simulator_advertisement(self):
-        """The type HA discovers must be a type the simulator actually publishes.
+    def test_manifest_advertises_no_zeroconf_discovery(self):
+        """The manifest must not claim a discovery flow the code does not implement.
 
-        This is the regression that made the simulator undiscoverable: it
-        advertised only _telnet while the manifest and pydeako both browse
-        _deako. See research/mdns-service-type-test-2026-08-11.md.
+        This is outcome O8, the map's safety control. The house has three Deako
+        nodes, telnet is exclusive, and one of the others serves SmartThings, so
+        binding to a node nobody chose takes that connection hostage. A zeroconf
+        block makes Home Assistant offer a discovered node for setup, and the
+        config flow has no discovery step to handle it. The configured address
+        is the only source of an address.
+
+        The discovery *module* stays vendored for a future user-driven picker,
+        which by design never auto-binds; what is deleted is the advertisement.
         """
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-        assert DEAKO_SERVICE_TYPE in manifest["zeroconf"], (
-            f"Manifest zeroconf {manifest['zeroconf']} must include "
-            f"{DEAKO_SERVICE_TYPE}, which the simulator advertises."
+        assert "zeroconf" not in manifest, (
+            f"Manifest must not advertise zeroconf discovery; got "
+            f"{manifest.get('zeroconf')}"
         )
 
 
