@@ -357,6 +357,51 @@ async def test_migration_supplies_the_default_port_when_none_was_stored():
 
 
 @pytest.mark.asyncio
+async def test_migration_of_the_entry_the_house_is_actually_running():
+    """The literal shape read off the house's disk, recorded in wayfinder #3.
+
+    Worth a test of its own because two details are easy to miss and neither was
+    invented here. The house entry was created by the **discovery flow**, so it
+    carries a `source` of zeroconf and a `discovery_keys` record that the
+    migration has no business rewriting. And the stored telnet delay is
+    `0.0001`, chosen to sit just above the deployed code's 1e-5 floor -- a live
+    setting rather than an inert default, so dropping it is a real change.
+    """
+    entry = make_entry(
+        data={"ip_address": "192.168.86.46", "port": 23},
+        options={
+            "ip_address": "192.168.86.46",
+            "port": 23,
+            LEGACY_TELNET_DELAY: 0.0001,
+        },
+        version=1,
+    )
+    entry.source = "zeroconf"
+    entry.unique_id = None
+    entry.discovery_keys = MappingProxyType(
+        {"zeroconf": ("231M000000000000._deako._tcp.local.",)}
+    )
+    hass = make_hass([entry])
+
+    assert await async_migrate_entry(hass, entry) is True
+    assert dict(entry.data) == {"ip_address": "192.168.86.46", "port": 23}
+    assert dict(entry.options) == {}
+    assert entry.version == 2
+    assert get_connection_address(entry) == "192.168.86.46:23"
+
+    # Provenance is Home Assistant's record, not ours. The migration passes
+    # neither to async_update_entry, so both must be exactly as they were.
+    assert entry.source == "zeroconf"
+    assert dict(entry.discovery_keys) == {
+        "zeroconf": ("231M000000000000._deako._tcp.local.",)
+    }
+    assert entry.entry_id == "entry-1", (
+        "The entry must be updated in place; a new entry_id would orphan every "
+        "entity and take its history with it."
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_current_entry_is_left_alone():
     """Migration only runs on old versions; a current entry must not change."""
     entry = make_entry(data={"ip_address": "9.9.9.9", "port": 23}, version=2)

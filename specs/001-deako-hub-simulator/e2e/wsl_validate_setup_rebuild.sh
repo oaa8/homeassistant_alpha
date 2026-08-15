@@ -347,14 +347,32 @@ entry = next(
     e for e in entries_store["data"]["entries"] if e["domain"] == "deako"
 )
 
-# The version 1 shape, exactly as the deployed release left it: the address
-# given at setup time sits in `data`, the address edited later on the options
-# screen sits in `options`, the two disagree, and both carry a telnet delay
-# that 0.6.0 made meaningless. Only `options` reaches the simulator, so the
-# migration is wrong unless the most recent edit wins.
+# The version 1 shape, taken from the entry the house is actually running --
+# read off disk and recorded in wayfinder #3, not imagined here:
+#
+#   "version": 1, "source": "zeroconf", "unique_id": null,
+#   "data":    {"ip_address": "...", "port": 23},
+#   "options": {"ip_address": "...", "port": 23,
+#               "telnet_message_receive_delay": 0.0001},
+#   "discovery_keys": {"zeroconf": ["231M...._deako._tcp.local."]}
+#
+# Two details of that shape matter and would be easy to miss. The house entry
+# was created by the **discovery flow**, so it carries a `source` of zeroconf
+# and a `discovery_keys` record -- a migration that dropped either would rewrite
+# provenance Home Assistant owns. And the stored delay is `0.0001`, chosen to
+# sit just above the deployed code's 1e-5 floor, so it is a live setting rather
+# than an inert default.
+#
+# The addresses are made to disagree deliberately: only `options` reaches the
+# simulator, so the migration is wrong unless the most recent edit wins.
 entry["version"] = 1
+entry["source"] = "zeroconf"
+entry["unique_id"] = None
 entry["data"] = {"ip_address": "192.168.86.99", "port": 23, delay_key: 0.1}
-entry["options"] = {"ip_address": ip, "port": int(port), delay_key: 0.5}
+entry["options"] = {"ip_address": ip, "port": int(port), delay_key: 0.0001}
+entry["discovery_keys"] = {
+    "zeroconf": [{"domain": "zeroconf", "key": "231M000000000000._deako._tcp.local.", "version": 1}]
+}
 
 with open(entries_path, "w", encoding="utf-8") as handle:
     json.dump(entries_store, handle, indent=2)
@@ -429,6 +447,18 @@ RENAMED_STATE=$(ha_state "$RENAMED_ENTITY")
 [ "$RENAMED_STATE" != "missing" ] && [ "$RENAMED_STATE" != "unavailable" ] && [ "$RENAMED_STATE" != "unreadable" ]
 report $? "the renamed entity kept its entity id, so its history survives" \
     "$RENAMED_ENTITY=$RENAMED_STATE (delete-and-re-add would have produced $RENAMED_FROM)"
+
+# The house's entry was created by the discovery flow, so it carries provenance
+# Home Assistant owns: a `source` of zeroconf and a `discovery_keys` record. The
+# migration has no business rewriting either -- and since it does not pass them
+# to async_update_entry, "unchanged" is the assertion that proves it.
+SOURCE=$(stored_entry source "$ENTRY_ID")
+[ "$SOURCE" = "zeroconf" ]; report $? \
+    "the entry's discovery provenance was not rewritten" "source=$SOURCE"
+
+DISCOVERY_KEYS=$(stored_entry discovery_keys "$ENTRY_ID")
+echo "$DISCOVERY_KEYS" | grep -q "_deako._tcp.local."; report $? \
+    "discovery_keys survived the migration untouched" "$DISCOVERY_KEYS"
 
 DUPLICATE=$(curl -s "$BASE/api/states" -H "$AUTH" \
     | python3 -c "import sys,json; print(len([x for x in json.load(sys.stdin) if x['entity_id'] == '$RENAMED_FROM']))")
