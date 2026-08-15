@@ -474,6 +474,417 @@ async def phase_pong_echo(host: str, port: int, journal: Journal) -> None:
     journal.record("pong_echo", attempts=5, error=last_error or "unknown")
 
 
+async def phase_scene_verbs(
+    host: str, port: int, probe_name: str, journal: Journal, gap: float = 0.6
+) -> None:
+    """Enumerate the hub's verb space, using error codes as the oracle.
+
+    Out of scope for this map, but the expensive part of the experiment is
+    getting the node awake, so it rides along with a window that already
+    exists. Hardware testing in October 2025 established that this firmware
+    answers an unknown message type with ``REQUEST_UNKNOWN``, a known type with
+    missing fields with ``REQUEST_MALFORMED``, and a known type with bad values
+    with ``REQUEST_INVALID``. So **any candidate answering something other than
+    REQUEST_UNKNOWN names a verb the firmware actually knows.**
+
+    Two design constraints, both learned the hard way:
+
+    * #17's probe run was **confounded** -- the node died partway through and
+      its silence was read as "ignored". Silence is not a valid answer to
+      anything, so every candidate is **bracketed** by a known-good command.
+      A negative is only trustworthy if a positive answers after it.
+    * The window may be **20 seconds**. Rather than waiting on each candidate
+      in turn, the whole set is sent as one burst with distinct transaction
+      ids and correlated on the way back, which collapses minutes into
+      seconds. The closing bracket proves the burst was processed to the end.
+    """
+    import uuid as uuid_mod
+
+    reader = writer = None
+    for attempt in range(1, 6):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=10.0
+            )
+            break
+        except (OSError, asyncio.TimeoutError) as exc:
+            journal.note(f"scene: connect attempt {attempt} failed ({exc}); retrying")
+            await asyncio.sleep(2.0)
+    if writer is None or reader is None:
+        journal.record("scene_verbs", error="could not connect")
+        return
+
+    sent: dict[str, str] = {}
+
+    async def send(label: str, message: dict[str, Any]) -> None:
+        tid = str(uuid_mod.uuid4())
+        message["transactionId"] = tid
+        message.setdefault("src", CLIENT_NAME)
+        message.setdefault("dst", "deako")
+        sent[tid] = label
+        writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\r\n")
+        await writer.drain()
+
+    try:
+        # Find the one load that is safe to move. Names are deliberately not
+        # journalled: this is the whole house inventory.
+        await send("device_list", {"type": "DEVICE_LIST"})
+        probe_uuid: str | None = None
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            try:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=deadline - time.monotonic()
+                )
+            except asyncio.TimeoutError:
+                break
+            if not line:
+                break
+            try:
+                msg = json.loads(line.decode(errors="replace").strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            data = msg.get("data") or {}
+            if msg.get("type") == "DEVICE_FOUND" and str(
+                data.get("name", "")
+            ).strip().lower() == probe_name.strip().lower():
+                probe_uuid = data.get("uuid")
+                break
+
+        if probe_uuid is None:
+            journal.record("scene_verbs", error=f"probe device {probe_name!r} not found")
+            return
+        journal.note(f"scene: bracketing with {probe_name} (uuid withheld)")
+
+        def bracket(dim: int) -> dict[str, Any]:
+            # power stays true throughout; this only ever changes brightness.
+            return {
+                "type": "CONTROL",
+                "data": {"target": probe_uuid, "state": {"power": True, "dim": dim}},
+            }
+
+        # A multi-target CONTROL is probed with the SAME uuid twice, so the
+        # question "is a list accepted at all" is answered without moving a
+        # second real light. Escalate only if a list is accepted.
+        pair = [probe_uuid, probe_uuid]
+        candidates: list[tuple[str, dict[str, Any]]] = [
+            ("SCENE", {"type": "SCENE"}),
+            ("SCENE_LIST", {"type": "SCENE_LIST"}),
+            ("GROUP", {"type": "GROUP"}),
+            ("GROUP_LIST", {"type": "GROUP_LIST"}),
+            ("GROUP_CONTROL", {"type": "GROUP_CONTROL"}),
+            ("ACTIVATE", {"type": "ACTIVATE"}),
+            ("TRIGGER", {"type": "TRIGGER"}),
+            ("PRESET", {"type": "PRESET"}),
+            ("MACRO", {"type": "MACRO"}),
+            ("BUTTON_PRESS", {"type": "BUTTON_PRESS"}),
+            ("DEVICE_POLL", {"type": "DEVICE_POLL"}),
+            (
+                "CONTROL:target=[uuid,uuid]",
+                {"type": "CONTROL", "data": {"target": pair, "state": {"power": True, "dim": 55}}},
+            ),
+            (
+                "CONTROL:targets=[uuid,uuid]",
+                {"type": "CONTROL", "data": {"targets": pair, "state": {"power": True, "dim": 55}}},
+            ),
+            (
+                "CONTROL:target=csv",
+                {
+                    "type": "CONTROL",
+                    "data": {
+                        "target": ",".join(pair),
+                        "state": {"power": True, "dim": 55},
+                    },
+                },
+            ),
+        ]
+
+        async def drain(seconds: float) -> None:
+            """Read whatever is available for a bounded time."""
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                try:
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=deadline - time.monotonic()
+                    )
+                except asyncio.TimeoutError:
+                    return
+                if not line:
+                    journal.note("scene: hub closed the connection")
+                    raise ConnectionResetError("hub closed mid-probe")
+                try:
+                    msg = json.loads(line.decode(errors="replace").strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                tid = msg.get("transactionId")
+                label = sent.get(tid) if tid else None
+                if label is None:
+                    # EVENTs for the whole house land here; keep only the shape.
+                    unmatched.append({"type": msg.get("type")})
+                else:
+                    replies.setdefault(label, []).append(msg)
+
+        replies: dict[str, list[dict[str, Any]]] = {}
+        unmatched: list[dict[str, Any]] = []
+
+        def answered(label: str) -> bool:
+            return bool(replies.get(label))
+
+        # One message at a time, with a gap. The previous run sent the whole
+        # set back to back and only the FIRST was ever answered, while the hub
+        # went on streaming events -- consistent with several messages landing
+        # in one TCP segment and the firmware reading only one. Both known
+        # clients send one message at a time, so match that.
+        dim_cycle = iter([45, 50, 40, 55, 35, 60, 42])
+        bracket_index = 0
+        confounded_at: str | None = None
+
+        async def send_bracket(tag: str) -> bool:
+            nonlocal bracket_index
+            bracket_index += 1
+            label = f"bracket_{bracket_index}_{tag}"
+            await send(label, bracket(next(dim_cycle, 45)))
+            await drain(gap * 3)
+            return answered(label)
+
+        if not await send_bracket("open"):
+            journal.record(
+                "scene_verbs",
+                error="the opening bracket went unanswered; the node was not "
+                "serving and nothing after it would mean anything",
+            )
+            return
+
+        results: dict[str, str] = {}
+        for index, (label, message) in enumerate(candidates, 1):
+            await send(label, message)
+            await drain(gap)
+            # Re-establish liveness every few candidates, so a death is
+            # localised rather than poisoning the whole set.
+            if index % 3 == 0 or index == len(candidates):
+                if not await send_bracket(f"after_{label}"):
+                    confounded_at = label
+                    journal.note(
+                        f"scene: bracket after {label} went unanswered -- "
+                        "everything from here is confounded"
+                    )
+                    break
+            results[label] = "answered" if answered(label) else "SILENCE"
+
+        classified = {}
+        for label, _ in candidates:
+            if label not in results:
+                classified[label] = {"answer": "NOT REACHED"}
+                continue
+            got = replies.get(label, [])
+            if not got:
+                classified[label] = {"answer": "SILENCE"}
+            else:
+                first = got[0]
+                classified[label] = {
+                    "answer": first.get("type"),
+                    "status": first.get("status"),
+                    "body": first,
+                }
+
+        journal.record(
+            "scene_verbs",
+            method="one message at a time, bracketed every 3 candidates",
+            gap_s=gap,
+            confounded_at=confounded_at,
+            negatives_trustworthy=confounded_at is None,
+            candidates=classified,
+            unmatched_traffic=len(unmatched),
+            note="a verb the firmware knows answers something other than "
+            "REQUEST_UNKNOWN; SILENCE counts only where a later bracket answered",
+        )
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+
+
+async def phase_payload_variants(
+    host: str, port: int, probe_name: str, journal: Journal, gap: float = 0.6
+) -> None:
+    """Probe multi-target CONTROL forms, each on its own fresh connection.
+
+    Both this session's first sweep and #17's original run stopped getting
+    answers at exactly the same place: the first ``CONTROL`` carrying a
+    non-string ``target``. If that message kills the connection, then every
+    variant after it in a shared sequence is untestable, and #17's "silently
+    ignored" readings were never readings at all.
+
+    So each variant gets a fresh connection, bracketed by a known-good
+    single-target command **before and after**. The closing bracket is the
+    whole experiment: if it answers, the variant was genuinely ignored; if it
+    does not, the variant **killed the connection**, which is a finding in its
+    own right rather than a failed probe.
+    """
+    import uuid as uuid_mod
+
+    probe_uuid: str | None = None
+    outcomes: dict[str, Any] = {}
+
+    async def one_connection(label: str, variant: dict[str, Any] | None) -> dict[str, Any]:
+        nonlocal probe_uuid
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10.0
+        )
+        sent: dict[str, str] = {}
+        replies: dict[str, list[dict[str, Any]]] = {}
+        events: list[Any] = []
+
+        async def send(tag: str, message: dict[str, Any]) -> None:
+            tid = str(uuid_mod.uuid4())
+            message["transactionId"] = tid
+            message.setdefault("src", CLIENT_NAME)
+            message.setdefault("dst", "deako")
+            sent[tid] = tag
+            writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\r\n")
+            await writer.drain()
+
+        async def drain(seconds: float) -> bool:
+            """Read for a bounded time. False if the hub closed on us."""
+            nonlocal probe_uuid
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                try:
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=deadline - time.monotonic()
+                    )
+                except asyncio.TimeoutError:
+                    return True
+                if not line:
+                    return False
+                try:
+                    msg = json.loads(line.decode(errors="replace").strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                tag = sent.get(msg.get("transactionId"))
+                if tag:
+                    replies.setdefault(tag, []).append(msg)
+                elif msg.get("type") == "EVENT":
+                    # An EVENT for the probe device is the only proof that a
+                    # command actually moved something. `status: ok` alone
+                    # does not mean the hub routed the message anywhere.
+                    data = msg.get("data") or {}
+                    if probe_uuid and data.get("target") == probe_uuid:
+                        events.append(data.get("state"))
+                elif probe_uuid is None:
+                    data = msg.get("data") or {}
+                    if msg.get("type") == "DEVICE_FOUND" and str(
+                        data.get("name", "")
+                    ).strip().lower() == probe_name.strip().lower():
+                        probe_uuid = data.get("uuid")
+            return True
+
+        try:
+            if probe_uuid is None:
+                await send("device_list", {"type": "DEVICE_LIST"})
+                await drain(6.0)
+                if probe_uuid is None:
+                    return {"error": f"probe device {probe_name!r} not found"}
+
+            def bracket(dim: int) -> dict[str, Any]:
+                return {
+                    "type": "CONTROL",
+                    "data": {"target": probe_uuid, "state": {"power": True, "dim": dim}},
+                }
+
+            await send("open", bracket(45))
+            alive = await drain(gap * 3)
+            if not replies.get("open"):
+                return {"error": "opening bracket unanswered; node not serving"}
+
+            if variant is not None:
+                await send("variant", variant)
+                alive = await drain(gap * 2)
+
+            await send("close", bracket(38))
+            alive = await drain(gap * 4) and alive
+            answered_close = bool(replies.get("close"))
+            variant_reply = (replies.get("variant") or [None])[0]
+            return {
+                "variant_answered": variant_reply,
+                "probe_device_events": events,
+                "connection_survived": answered_close,
+                "verdict": (
+                    "ignored, connection intact"
+                    if answered_close and variant_reply is None
+                    else "answered"
+                    if variant_reply is not None
+                    else "KILLED THE CONNECTION"
+                ),
+            }
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+
+    # A control run with no variant at all, proving the rig itself does not
+    # kill connections -- otherwise a kill proves nothing.
+    try:
+        outcomes["control_no_variant"] = await one_connection("control", None)
+    except (OSError, asyncio.TimeoutError) as exc:
+        outcomes["control_no_variant"] = {"error": str(exc)}
+
+    variants = [
+        (
+            "target=[uuid,uuid]",
+            lambda u: {"type": "CONTROL", "data": {"target": [u, u], "state": {"power": True, "dim": 55}}},
+        ),
+        (
+            "targets=[uuid,uuid]",
+            lambda u: {"type": "CONTROL", "data": {"targets": [u, u], "state": {"power": True, "dim": 55}}},
+        ),
+        (
+            "target=csv",
+            lambda u: {"type": "CONTROL", "data": {"target": f"{u},{u}", "state": {"power": True, "dim": 55}}},
+        ),
+        (
+            "target=missing",
+            lambda _u: {"type": "CONTROL", "data": {"state": {"power": True, "dim": 55}}},
+        ),
+        # Disambiguates the "csv was accepted" result. If a deliberately
+        # corrupted target ALSO returns ok, then ok means "message parsed",
+        # not "message routed", and the csv result carries no information.
+        (
+            "target=uuid+garbage",
+            lambda u: {
+                "type": "CONTROL",
+                "data": {"target": f"{u}ZZZZ", "state": {"power": True, "dim": 52}},
+            },
+        ),
+        # Same csv form again, this time watching for an EVENT naming the
+        # probe device -- the only proof the command actually moved anything.
+        (
+            "target=csv (event-watched)",
+            lambda u: {
+                "type": "CONTROL",
+                "data": {"target": f"{u},{u}", "state": {"power": True, "dim": 58}},
+            },
+        ),
+    ]
+    for label, build in variants:
+        if probe_uuid is None:
+            outcomes[label] = {"error": "no probe uuid"}
+            continue
+        try:
+            outcomes[label] = await one_connection(label, build(probe_uuid))
+        except (OSError, asyncio.TimeoutError) as exc:
+            outcomes[label] = {"verdict": "KILLED THE CONNECTION", "error": str(exc)}
+        await asyncio.sleep(0.5)
+
+    journal.record(
+        "payload_variants",
+        method="one fresh connection per variant, bracketed before and after",
+        outcomes=outcomes,
+        note="a variant that leaves the closing bracket unanswered killed the "
+        "connection; that is why a shared-connection sweep cannot test these",
+    )
+
+
 async def phase_enumerate(client: Deako, journal: Journal) -> dict[str, Any]:
     """Time a full enumeration through the library, not the raw socket."""
     start = time.monotonic()
@@ -789,6 +1200,24 @@ async def run(args: argparse.Namespace) -> int:
             except (OSError, asyncio.TimeoutError) as exc:
                 journal.record("pong_echo", error=str(exc))
 
+        if "scene" in phases:
+            journal.note("--- phase scene_verbs ---")
+            try:
+                await phase_scene_verbs(
+                    hub_host, hub_port, args.probe_device, journal
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                journal.record("scene_verbs", error=str(exc))
+
+        if "payload" in phases:
+            journal.note("--- phase payload_variants ---")
+            try:
+                await phase_payload_variants(
+                    hub_host, hub_port, args.probe_device, journal
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                journal.record("payload_variants", error=str(exc))
+
         needs_hub = phases & {"enumerate", "blackhole", "fin", "reset", "restart"}
         if needs_hub:
             await proxy.start()
@@ -869,7 +1298,17 @@ async def run(args: argparse.Namespace) -> int:
     return 0
 
 
-ALL_PHASES = ["pong", "enumerate", "blackhole", "fin", "reset", "churn", "restart"]
+ALL_PHASES = [
+    "pong",
+    "scene",
+    "payload",
+    "enumerate",
+    "blackhole",
+    "fin",
+    "reset",
+    "churn",
+    "restart",
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
