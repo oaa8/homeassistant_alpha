@@ -297,12 +297,46 @@ async def cmd_control(conn_factory: Callable[[], DeakoConnection], args) -> int:
     return 0
 
 
+async def wait_for_node(host: str, port: int, timeout: float, capture: Capture) -> bool:
+    """Block until the node accepts a connection, so a restart can be measured.
+
+    Polls with a connect-and-close, which is the only way to tell that the
+    telnet server is serving again. Reports how long the wait took, which is
+    the switch's own time-to-ready after a restart.
+    """
+    capture.note(f"waiting up to {timeout}s for {host}:{port} to accept connections")
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=2.0
+            )
+        except (OSError, asyncio.TimeoutError):
+            await asyncio.sleep(1.0)
+            continue
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        waited = time.monotonic() - start
+        capture.note(f"node accepted a connection after {waited:.1f}s of waiting")
+        return True
+    capture.note("node never came back within the timeout")
+    return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", required=True, help="node address")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--client", default=DEFAULT_CLIENT, help="client name sent as src")
     parser.add_argument("--log", type=Path, help="append the capture to this file")
+    parser.add_argument(
+        "--wait-for-node",
+        type=float,
+        metavar="SECONDS",
+        help="poll until the node accepts connections before running the command, "
+        "so behaviour immediately after a restart can be measured",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -344,8 +378,15 @@ def main() -> int:
     def factory() -> DeakoConnection:
         return DeakoConnection(args.host, args.port, args.client, capture)
 
+    async def run() -> int:
+        if args.wait_for_node and not await wait_for_node(
+            args.host, args.port, args.wait_for_node, capture
+        ):
+            return 2
+        return await args.func(factory, args)
+
     try:
-        return asyncio.run(args.func(factory, args))
+        return asyncio.run(run())
     except KeyboardInterrupt:
         return 130
     finally:
