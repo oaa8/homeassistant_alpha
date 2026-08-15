@@ -53,6 +53,7 @@ class _Manager:
         incoming_json_callback,
         client_name: str | None = None,
         on_connect: Callable[[], Awaitable[None]] | None = None,
+        on_connection_change: Callable[[bool], None] | None = None,
     ) -> None:
         """Initialize with get address function and incoming json callback."""
         self.get_address = get_address
@@ -69,6 +70,13 @@ class _Manager:
         # firing here as well made every setup request the device list twice.
         self.on_connect = on_connect
         self.has_connected_before = False
+        # DEVIATION (O5): fired with the new answer whenever is_connected()
+        # changes, so a consumer can show "broken" instead of serving cached
+        # state that stopped being true. Every transition is announced from
+        # notify_connection_change, which dedupes, so callers may prod it
+        # whenever they suspect the answer moved.
+        self.on_connection_change = on_connection_change
+        self.reported_connected = False
 
     async def init_connection(self) -> None:
         """Initialize the connection process."""
@@ -83,7 +91,17 @@ class _Manager:
             self.create_connection_task()
             self.state.connecting = False
             return
-        connection = _Connection(address, name, self.incoming_json)
+        connection = _Connection(
+            address,
+            name,
+            self.incoming_json,
+            # DEVIATION (O5): the socket dies in _Connection, not here -- a FIN
+            # or a failed send moves it to ERROR without anything in the
+            # manager being told. Hooking the transition is what makes
+            # "unavailable" arrive in half a second rather than waiting on the
+            # next ping window.
+            on_state_change=self.notify_connection_change,
+        )
         timeout = 0
         while not connection.is_connected() and timeout < CONNECTION_TIMEOUT_S:
             await asyncio.sleep(CONNECTED_POLLING_INTERVAL_S)
@@ -92,6 +110,7 @@ class _Manager:
             _LOGGER.error("Timeout attempting to connect. Trying again")
             self.state.connecting = False
             connection.close()
+            self.notify_connection_change()
             self.create_connection_task()
             return
         self.connection = connection
@@ -102,6 +121,11 @@ class _Manager:
                 self.maintain_connection_worker()
             )
         self.state.connecting = False
+        # is_connected() needs `self.connection` set and `canceled` cleared,
+        # neither of which was true when the socket announced CONNECTED above,
+        # so that transition reported "still down". Ask again now that all
+        # three parts of the answer agree.
+        self.notify_connection_change()
 
         # DEVIATION (O7): stock resumed listening here and never asked the hub
         # what the state is now, so a change made during an outage could stay
@@ -133,6 +157,32 @@ class _Manager:
             and self.connection.socket.sock is not None
         )
 
+    def notify_connection_change(self) -> None:
+        """Announce a change in is_connected() to the listener, if any.
+
+        DEVIATION (O5): when it's broken, you have to be able to tell. This is
+        the push half of that -- is_connected() is the answer, and this is what
+        says "the answer just moved" so nothing has to poll for it.
+
+        Deduped on the last value reported, because it is called from several
+        places that each only *suspect* a transition: the socket's own state
+        machine, the end of a connection attempt, and close().
+        """
+        connected = self.is_connected()
+        if connected == self.reported_connected:
+            return
+        self.reported_connected = connected
+        _LOGGER.info(
+            "Connection to the hub is now %s",
+            "up" if connected else "down",
+        )
+        if self.on_connection_change is None:
+            return
+        try:
+            self.on_connection_change(connected)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.error("Connection change listener failed: %s", exc)
+
     def close(self) -> None:
         """Close connection."""
         _LOGGER.debug("Closing connection and canceling workers")
@@ -152,6 +202,12 @@ class _Manager:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
+
+        # DEVIATION (O5): close() is how the ping watchdog drops a blackholed
+        # connection, so this is the path a hub that stopped answering takes.
+        # Without this the entities would stay looking healthy until something
+        # else happened to ask.
+        self.notify_connection_change()
 
     def create_connection_task(self):
         """Create an async task to initiate connection."""
@@ -232,9 +288,9 @@ class _Manager:
         power,
         dim=None,
         completed_callback: Callable | None = None,
-    ) -> None:
-        """Send a state change request."""
-        await self.send_request(
+    ) -> bool:
+        """Send a state change request, reporting whether it was sent."""
+        return await self.send_request(
             _Request(
                 state_change_request(
                     uuid, power, dim, source=self.client_name,
@@ -246,8 +302,10 @@ class _Manager:
     async def send_request(self, req: _Request) -> bool:
         """Send a request."""
         if self.connection is not None:
-            await self.connection.send_data(req.get_body_str())
-            return True
+            # DEVIATION (O5): a send that failed on a dead socket used to be
+            # reported as success, because send_data returned None either way.
+            # A command issued while disconnected has to fail visibly.
+            return await self.connection.send_data(req.get_body_str())
 
         _LOGGER.warning("No connection to send data to")
         return False

@@ -15,7 +15,7 @@ and a future Deako release is a rebase rather than a rewrite.
 """
 # pylint: disable=duplicate-code
 from .discover import DeakoDiscoverer, DevicesNotFoundException
-from .deako import Deako, FindDevicesError
+from .deako import Deako, DeviceCommandError, FindDevicesError
 from .models import (
     RequestType,
     ResponseType,
@@ -28,6 +28,7 @@ __all__ = [
     'DeakoDiscoverer',
     'DevicesNotFoundException',
     'Deako',
+    'DeviceCommandError',
     'FindDevicesError',
     'RequestType',
     'ResponseType',

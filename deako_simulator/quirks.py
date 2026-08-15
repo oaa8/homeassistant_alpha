@@ -93,6 +93,16 @@ class QuirkManager:
         self._running = False
         self._last_whitespace_time: float = 0.0  # Track last whitespace injection
         self._active_connection: Optional[asyncio.StreamWriter] = None  # Track active connection for failure simulation
+        # Devices held back from the DEVICE_FOUND stream (wayfinder #16, O10).
+        #
+        # This is fault *injection*, not a model of hub behaviour: it produces
+        # the observable "the count said N, only N-1 arrived", which is the
+        # only thing the availability model reacts to. How real firmware
+        # represents a switch it knows about but cannot reach is still an open
+        # question (wayfinder #13), so nothing here claims an answer to it --
+        # in particular, withheld devices are still counted, because dropping
+        # them from the count as well would be inventing a second behaviour.
+        self._withheld_devices: set[str] = set()
         
         logger.info(
             "QuirkManager initialized: whitespace=%s, delays=%s, malformed=%s",
@@ -203,6 +213,39 @@ class QuirkManager:
         else:
             logger.debug("QuirkManager cleared active connection reference")
     
+    def set_withheld_devices(self, uuids: set[str]) -> None:
+        """Hold devices back from the DEVICE_FOUND stream (wayfinder #16, O10).
+
+        Args:
+            uuids: Device uuids to withhold. Replaces any previous set.
+
+        Purpose: produce an enumeration shortfall -- DEVICE_LIST reports the
+        full count, and one or more of the promised DEVICE_FOUND messages never
+        arrives. That is the only observable the availability model reacts to.
+
+        This deliberately does not model a registered-but-unreachable switch;
+        what the real hub does in that case is still unanswered (wayfinder
+        #13). It injects a missing message, nothing more.
+        """
+        self._withheld_devices = set(uuids)
+        logger.info(
+            "Withholding %d device(s) from the DEVICE_FOUND stream: %s",
+            len(self._withheld_devices),
+            sorted(self._withheld_devices) or "none",
+        )
+
+    def is_withheld(self, uuid: str) -> bool:
+        """Return whether this device is currently being withheld."""
+        return uuid in self._withheld_devices
+
+    def release_device(self, uuid: str) -> bool:
+        """Stop withholding one device. Returns whether it was withheld."""
+        was_withheld = uuid in self._withheld_devices
+        self._withheld_devices.discard(uuid)
+        if was_withheld:
+            logger.info("Released device %s; it will report from now on", uuid)
+        return was_withheld
+
     async def simulate_connection_failure(self) -> bool:
         """Forcibly close the active connection to simulate network failure.
         
