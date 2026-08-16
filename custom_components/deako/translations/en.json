@@ -34,5 +34,31 @@
       "invalid_port": "The port has to be a whole number between 1 and 65535.",
       "already_configured": "A Deako switch at that address is already set up."
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "hub_connected": {
+        "name": "Connected"
+      }
+    },
+    "sensor": {
+      "node_status": {
+        "name": "Node status",
+        "state": {
+          "online": "Online",
+          "unreachable": "Unreachable",
+          "hub_disconnected": "Hub disconnected"
+        }
+      },
+      "reconnects": {
+        "name": "Reconnects since restart"
+      },
+      "last_message_age": {
+        "name": "Time since last hub message"
+      },
+      "devices_reporting": {
+        "name": "Devices reporting"
+      }
+    }
   }
 }

@@ -149,13 +149,14 @@ async def test_device_poll_request_response_flow(simulator_port):
     reader, writer = await asyncio.open_connection('127.0.0.1', port)
     
     try:
-        # Send DEVICE_POLL request for device with known state
+        # Send DEVICE_POLL request for device with known state.
+        # `target` sits at the request root: wayfinder #13 put this verb on the
+        # wire for the first time and found the data.target form -- which this
+        # suite used to assert -- is answered with silence by real firmware.
         device_poll_request = {
             "name": "DEVICE_POLL",
             "transactionId": "test-poll-001",
-            "data": {
-                "target": "22222222-2222-4222-8222-222222222222"  # Living Room Main, power=True, dim=75
-            }
+            "target": "22222222-2222-4222-8222-222222222222"  # Living Room Main, power=True, dim=75
         }
         await send_message(writer, device_poll_request)
         
@@ -167,31 +168,38 @@ async def test_device_poll_request_response_flow(simulator_port):
             f"Expected response type 'DEVICE_POLL' but got '{response['type']}' - real hub uses 'type' field"
         assert response["src"] == "deako", \
             f"Expected src 'deako' - real hub always sets src"
-        assert "dst" in response, \
-            "Missing 'dst' field - real hub echoes client's src as dst"
+        assert response["dst"] == "deako", \
+            "DEVICE_POLL is the one reply where the hub addresses itself " \
+            "rather than the client (wayfinder #13)"
         assert response["transactionId"] == "test-poll-001", \
             f"Expected transactionId 'test-poll-001' but got '{response['transactionId']}' - integration can't correlate response"
         
-        # FR-023 hardware quirk: DEVICE_POLL returns status="error" even on success
-        # See: research/device-state-test-2025-10-18.md
+        # Hardware quirk: DEVICE_POLL returns status="error" even on success.
+        # Measured across 534 replies: 534 error, zero ok. It is a constant,
+        # not a signal -- branch on whether `data` carries a device.
         assert response["status"] == "error", \
-            f"Expected status 'error' per FR-023 hardware quirk but got '{response['status']}' - must match real hub behavior"
+            f"Expected status 'error' per the hardware quirk but got '{response['status']}' - must match real hub behavior"
         
         assert "data" in response, \
             "Missing 'data' field in response - integration can't extract device state"
         
-        # Validate device state fields
+        # Validate device state fields. The device arrives in the same shape
+        # DEVICE_FOUND uses: name, uuid, capabilities, and a nested state.
         data = response["data"]
-        assert "power" in data, \
-            "Missing 'power' field in response data - integration needs current on/off state"
-        assert "dim" in data, \
-            "Missing 'dim' field in response data - integration needs current brightness level"
+        assert data["uuid"] == "22222222-2222-4222-8222-222222222222", \
+            "Missing or wrong uuid - integration can't tell which device answered"
+        assert data["capabilities"] == "power+dim", \
+            f"Expected capabilities 'power+dim' but got {data.get('capabilities')!r}"
+        assert "power" in data["state"], \
+            "Missing 'power' field in response state - integration needs current on/off state"
+        assert "dim" in data["state"], \
+            "Missing 'dim' field in response state - integration needs current brightness level"
         
         # Verify state matches expected device state
-        assert data["power"] == True, \
-            f"Expected power=True but got {data['power']} - state doesn't match device"
-        assert data["dim"] == 75, \
-            f"Expected dim=75 but got {data['dim']} - state doesn't match device"
+        assert data["state"]["power"] == True, \
+            f"Expected power=True but got {data['state']['power']} - state doesn't match device"
+        assert data["state"]["dim"] == 75, \
+            f"Expected dim=75 but got {data['state']['dim']} - state doesn't match device"
         
     finally:
         writer.close()
@@ -220,37 +228,41 @@ async def test_device_poll_returns_current_state(simulator_port):
         await send_message(writer, {
             "name": "DEVICE_POLL",
             "transactionId": "poll-device-1",
-            "data": {"target": "11111111-1111-4111-8111-111111111111"}
+            "target": "11111111-1111-4111-8111-111111111111"
         })
         response1 = await asyncio.wait_for(read_message(reader), timeout=1.0)
-        assert response1["data"]["power"] == False, \
+        assert response1["data"]["state"]["power"] == False, \
             "Device 1 should have power=False"
-        assert response1["data"]["dim"] == 0, \
+        assert response1["data"]["state"]["dim"] == 0, \
             "Device 1 should have dim=0"
         
         # Test device 2: power=True, dim=75
         await send_message(writer, {
             "name": "DEVICE_POLL",
             "transactionId": "poll-device-2",
-            "data": {"target": "22222222-2222-4222-8222-222222222222"}
+            "target": "22222222-2222-4222-8222-222222222222"
         })
         response2 = await asyncio.wait_for(read_message(reader), timeout=1.0)
-        assert response2["data"]["power"] == True, \
+        assert response2["data"]["state"]["power"] == True, \
             "Device 2 should have power=True"
-        assert response2["data"]["dim"] == 75, \
+        assert response2["data"]["state"]["dim"] == 75, \
             "Device 2 should have dim=75"
         
-        # Test device 3: power=True, dim=None (power-only device)
+        # Test device 3: power-only device. `dim` is absent from its state
+        # entirely, not present and null -- 185 real DEVICE_FOUND records
+        # carry dim only for devices whose capabilities are power+dim.
         await send_message(writer, {
             "name": "DEVICE_POLL",
             "transactionId": "poll-device-3",
-            "data": {"target": "33333333-3333-4333-8333-333333333333"}
+            "target": "33333333-3333-4333-8333-333333333333"
         })
         response3 = await asyncio.wait_for(read_message(reader), timeout=1.0)
-        assert response3["data"]["power"] == True, \
+        assert response3["data"]["state"]["power"] == True, \
             "Device 3 should have power=True"
-        assert response3["data"]["dim"] is None, \
-            "Device 3 is power-only, dim should be None"
+        assert response3["data"]["capabilities"] == "power", \
+            "Device 3 is power-only"
+        assert "dim" not in response3["data"]["state"], \
+            "Device 3 is power-only, so its state carries no dim at all"
         
     finally:
         writer.close()
@@ -279,9 +291,7 @@ async def test_device_poll_nonexistent_device(simulator_port):
         device_poll_request = {
             "name": "DEVICE_POLL",
             "transactionId": "test-invalid-001",
-            "data": {
-                "target": "99999999-9999-4999-8999-999999999999"  # Non-existent UUID
-            }
+            "target": "99999999-9999-4999-8999-999999999999"  # Non-existent UUID
         }
         await send_message(writer, device_poll_request)
         
@@ -294,7 +304,7 @@ async def test_device_poll_nonexistent_device(simulator_port):
         assert response["src"] == "deako", \
             f"Expected src 'deako' - real hub always sets src"
         assert "dst" in response, \
-            "Missing 'dst' field - real hub echoes client's src as dst"
+            "Missing 'dst' field"
         assert response["transactionId"] == "test-invalid-001", \
             f"Expected transactionId 'test-invalid-001' but got '{response['transactionId']}'"
         assert response["status"] == "error", \
@@ -344,9 +354,7 @@ async def test_device_poll_status_error_quirk(simulator_port):
         device_poll_request = {
             "name": "DEVICE_POLL",
             "transactionId": "test-quirk-001",
-            "data": {
-                "target": "11111111-1111-4111-8111-111111111111"
-            }
+            "target": "11111111-1111-4111-8111-111111111111"
         }
         await send_message(writer, device_poll_request)
         
@@ -355,15 +363,20 @@ async def test_device_poll_status_error_quirk(simulator_port):
         
         # Verify quirk: status="error" even though query succeeded
         assert response["status"] == "error", \
-            f"DEVICE_POLL must return status='error' per FR-023 hardware quirk (validated 2025-10-18), but got '{response['status']}'"
+            f"DEVICE_POLL must return status='error' per the hardware quirk (534/534 replies), but got '{response['status']}'"
         
         # Verify we still got valid device state (proves success despite status="error")
         assert "data" in response, \
             "Despite status='error', successful DEVICE_POLL must include data field with device state"
-        assert "power" in response["data"], \
+        assert "power" in response["data"]["state"], \
             "Device state should be present despite status='error' quirk"
-        assert isinstance(response["data"]["power"], bool), \
+        assert isinstance(response["data"]["state"]["power"], bool), \
             "Power state should be valid boolean despite status='error'"
+        
+        # The success reply carries a device, never a code. That is the only
+        # way to tell it from a real error, because `status` never varies.
+        assert "code" not in response["data"], \
+            "A successful poll carries the device, not an error code"
         
         # If error code is present, it should NOT be REQUEST_INVALID (that's for actual errors)
         # The quirk is: status="error" but no error code (or error code is empty/absent)
@@ -378,46 +391,60 @@ async def test_device_poll_status_error_quirk(simulator_port):
 
 
 @pytest.mark.asyncio
-async def test_device_poll_missing_target_field(simulator_port):
+async def test_device_poll_without_root_target_is_silent(simulator_port):
     """
-    Test DEVICE_POLL with missing target field.
-    
-    User Story 2 Acceptance: Simulator validates required fields
-    FR-066: DEVICE_POLL with missing required fields returns REQUEST_MALFORMED error
-    
-    Expected: Error response with code "REQUEST_MALFORMED"
-    Actual: Error message should indicate missing "target" field
-    Impact: Integration must provide all required fields
+    Test the two DEVICE_POLL request forms real hardware ignores.
+
+    `target` sits at the message *root*. Wayfinder #13 sent this verb properly
+    for the first time and measured both alternatives:
+
+    - the `data.target` form, which the vendor documentation's structure
+      implies and which this simulator was for a while the only thing in the
+      world that answered, and
+    - the bare form with no target at all, which wayfinder #19 sent and got a
+      silence it correctly refused to interpret.
+
+    Both are met with **silence**. Answering them let a client pass a test the
+    real hub fails, which is precisely the "don't test against imagination"
+    trap this map keeps hitting.
     """
     port, simulator = simulator_port
-    
-    # Connect to simulator
+
     reader, writer = await asyncio.open_connection('127.0.0.1', port)
-    
+
     try:
-        # Send DEVICE_POLL request without target field
-        device_poll_request = {
-            "name": "DEVICE_POLL",
-            "transactionId": "test-missing-001",
-            "data": {}  # Missing "target" field
-        }
-        await send_message(writer, device_poll_request)
-        
-        # Read error response
-        response = await asyncio.wait_for(read_message(reader), timeout=1.0)
-        
-        # Validate error response
-        assert response["status"] == "error", \
-            f"Expected status 'error' for malformed request but got '{response['status']}'"
-        assert "data" in response, \
-            "Missing 'data' field in error response"
-        assert "code" in response["data"], \
-            "Missing error 'code' in response data"
-        
-        # FR-066: Error code must be REQUEST_MALFORMED for missing required fields
-        assert response["data"]["code"] == "REQUEST_MALFORMED", \
-            f"Expected error code 'REQUEST_MALFORMED' but got '{response['data']['code']}'"
-        
+        for label, request in (
+            ("data.target", {
+                "name": "DEVICE_POLL",
+                "transactionId": "test-datatarget-001",
+                "data": {"target": "11111111-1111-4111-8111-111111111111"},
+            }),
+            ("bare", {
+                "name": "DEVICE_POLL",
+                "transactionId": "test-bare-001",
+            }),
+        ):
+            await send_message(writer, request)
+
+            with pytest.raises(asyncio.TimeoutError):
+                response = await asyncio.wait_for(
+                    read_message(reader), timeout=0.5
+                )
+                pytest.fail(
+                    f"The {label} form of DEVICE_POLL was answered with "
+                    f"{response!r}; hardware answers it with silence"
+                )
+
+        # The connection is still usable: silence is being ignored, not an
+        # error being suppressed, and the real hub keeps talking afterwards.
+        await send_message(writer, {
+            "name": "PING",
+            "transactionId": "test-still-alive",
+        })
+        pong = await asyncio.wait_for(read_message(reader), timeout=1.0)
+        assert pong["type"] == "PING" and pong["status"] == "ok", \
+            "The connection must survive a DEVICE_POLL the hub ignores"
+
     finally:
         writer.close()
         await writer.wait_closed()
@@ -444,10 +471,10 @@ async def test_device_poll_after_state_change(simulator_port):
         await send_message(writer, {
             "name": "DEVICE_POLL",
             "transactionId": "poll-before",
-            "data": {"target": "11111111-1111-4111-8111-111111111111"}
+            "target": "11111111-1111-4111-8111-111111111111"
         })
         initial_state = await asyncio.wait_for(read_message(reader), timeout=1.0)
-        assert initial_state["data"]["power"] == False, \
+        assert initial_state["data"]["state"]["power"] == False, \
             "Device should start with power=False"
         
         # Change state via CONTROL (will be implemented in Phase 5)
@@ -462,14 +489,14 @@ async def test_device_poll_after_state_change(simulator_port):
         await send_message(writer, {
             "name": "DEVICE_POLL",
             "transactionId": "poll-after",
-            "data": {"target": "11111111-1111-4111-8111-111111111111"}
+            "target": "11111111-1111-4111-8111-111111111111"
         })
         updated_state = await asyncio.wait_for(read_message(reader), timeout=1.0)
         
         # Verify state updated
-        assert updated_state["data"]["power"] == True, \
+        assert updated_state["data"]["state"]["power"] == True, \
             "DEVICE_POLL should reflect updated power state"
-        assert updated_state["data"]["dim"] == 50, \
+        assert updated_state["data"]["state"]["dim"] == 50, \
             "DEVICE_POLL should reflect updated dim level"
         
     finally:

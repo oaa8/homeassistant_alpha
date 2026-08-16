@@ -90,6 +90,8 @@ class _StubManager:
         self.state_changes = 0
         self.send_ok = send_ok
         self.connected = False
+        self.reconnect_count = 0
+        self.last_message_age: float | None = None
 
     async def send_get_device_list(self) -> bool:
         self.device_list_requests += 1
@@ -100,6 +102,9 @@ class _StubManager:
     ) -> bool:
         self.state_changes += 1
         return self.send_ok
+
+    def seconds_since_last_message(self) -> float | None:
+        return self.last_message_age
 
     def is_connected(self) -> bool:
         return self.connected
@@ -133,7 +138,194 @@ async def offline_checks() -> None:
         f"dim={dim!r} (dimmables do not send dim on plain on/off)",
     )
 
-    # -- O7a: record_device notifies ----------------------------------------
+    # -- wayfinder #23: the diagnostic signals and the witness detector -------
+    #
+    # The window is 5s in production (3x the 1.60s measured between a CONTROL
+    # acknowledgement and its confirming EVENT on real hardware). Shortened
+    # here so the *logic* can be checked in milliseconds; what the constant
+    # should be is a hardware question, not a branch question.
+    original_window = deako_module.WITNESS_WINDOW_S
+    deako_module.WITNESS_WINDOW_S = 0.05
+    try:
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+        reachability: list[tuple[str, bool]] = []
+        deako.add_reachability_listener(
+            lambda uuid, reachable: reachability.append((uuid, reachable))
+        )
+
+        # One miss is a lost mesh frame, and must not mark anything.
+        await deako.control_device(DIMMABLE_UUID, False)
+        await asyncio.sleep(0.2)
+        check(
+            "#23 one unwitnessed command does not mark a device unreachable",
+            deako.is_reachable(DIMMABLE_UUID) and reachability == [],
+            f"misses={deako.consecutive_misses.get(DIMMABLE_UUID)}, "
+            "one miss is a lost frame",
+        )
+
+        # Two consecutive is the pattern a person is already complaining about.
+        await deako.control_device(DIMMABLE_UUID, True)
+        await asyncio.sleep(0.2)
+        check(
+            "#23 two consecutive unwitnessed commands mark it unreachable",
+            not deako.is_reachable(DIMMABLE_UUID)
+            and reachability == [(DIMMABLE_UUID, False)],
+            f"unreachable={deako.get_unreachable()}, "
+            f"listener calls={reachability}",
+        )
+
+        # Any EVENT clears it, from any source.
+        deako.incoming_json({
+            "type": "EVENT",
+            "data": {
+                "eventType": "DEVICE_STATE_CHANGE",
+                "target": DIMMABLE_UUID,
+                "state": {"power": True, "dim": 80},
+            },
+        })
+        check(
+            "#23 any EVENT for the device clears the mark",
+            deako.is_reachable(DIMMABLE_UUID)
+            and reachability[-1] == (DIMMABLE_UUID, True),
+            f"unreachable={deako.get_unreachable()}",
+        )
+
+        # An acknowledged send whose EVENT arrives inside the window is not a
+        # miss. This is the check that would fail if the detector counted acks.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+        await deako.control_device(DIMMABLE_UUID, False)
+        deako.incoming_json({
+            "type": "EVENT",
+            "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+        })
+        await asyncio.sleep(0.2)
+        check(
+            "#23 a witnessed command counts no miss at all",
+            deako.is_reachable(DIMMABLE_UUID)
+            and DIMMABLE_UUID not in deako.consecutive_misses,
+            f"misses={deako.consecutive_misses}",
+        )
+
+        # A window still open when the socket dies proves nothing: the EVENT
+        # could not have reached us either way. Without this, one hub outage
+        # would mark every light anybody happened to touch.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+        await deako.control_device(DIMMABLE_UUID, False)
+        deako.notify_connection_listeners(False)
+        await asyncio.sleep(0.2)
+        check(
+            "#23 losing the connection voids the open witness window",
+            deako.is_reachable(DIMMABLE_UUID)
+            and DIMMABLE_UUID not in deako.consecutive_misses
+            and deako.pending_witness == {},
+            f"misses={deako.consecutive_misses}, pending={deako.pending_witness}",
+        )
+
+        # A send that never left the machine is not the device's fault either.
+        deako, manager = _stub_deako(send_ok=False)
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+        try:
+            await deako.control_device(DIMMABLE_UUID, False)
+        except DeviceCommandError:
+            pass
+        await asyncio.sleep(0.2)
+        check(
+            "#23 a command that failed to send opens no window",
+            deako.pending_witness == {}
+            and DIMMABLE_UUID not in deako.consecutive_misses,
+            "the probe is the command that actually left",
+        )
+    finally:
+        deako_module.WITNESS_WINDOW_S = original_window
+
+    # -- wayfinder #23: per-sweep enumeration accounting ---------------------
+    #
+    # Tracked outside the device cache on purpose: that cache is never cleared,
+    # so a device missing from a later sweep leaves its old entry in place and
+    # a cache lookup could never notice.
+    deako, _ = _stub_deako()
+    reported: list[int] = []
+    deako.add_sweep_listener(lambda: reported.append(1))
+
+    def _found(uuid: str, name: str) -> dict:
+        return {
+            "type": "DEVICE_FOUND",
+            "data": {
+                "uuid": uuid,
+                "name": name,
+                "capabilities": "power",
+                "state": {"power": False},
+            },
+        }
+
+    deako.incoming_json({"type": "DEVICE_LIST", "data": {"number_of_devices": 2}})
+    deako.incoming_json(_found(DIMMABLE_UUID, "Dimmer"))
+    deako.incoming_json(_found(NON_DIMMABLE_UUID, "Switch"))
+    reporting, expected, missing = deako.get_last_sweep()
+    check(
+        "#23 a complete sweep concludes as soon as the last device reports",
+        (reporting, expected, missing) == (2, 2, []) and len(reported) == 1,
+        f"reporting={reporting}, expected={expected}, missing={missing}, "
+        f"listener calls={len(reported)} (it must not wait out the window)",
+    )
+
+    # A second sweep that drops a device the cache still holds. The hub has
+    # never once done this in ten measured sweeps, so this is a tripwire for
+    # something never yet seen -- but it has to work if it is ever tripped.
+    deako.incoming_json({"type": "DEVICE_LIST", "data": {"number_of_devices": 1}})
+    deako.incoming_json(_found(DIMMABLE_UUID, "Dimmer"))
+    reporting, expected, missing = deako.get_last_sweep()
+    check(
+        "#23 a device missing from a later sweep is named, not lost in the cache",
+        (reporting, expected, missing) == (1, 1, [NON_DIMMABLE_UUID]),
+        f"reporting={reporting}, expected={expected}, missing={missing} "
+        f"(the cache still holds {len(deako.get_devices())} devices)",
+    )
+    deako.cancel_sweep_timer()
+
+    deako, _ = _stub_deako()
+    reporting, expected, missing = deako.get_last_sweep()
+    check(
+        "#23 before any sweep the count is unknown rather than zero",
+        reporting is None and expected is None and missing == [],
+        f"reporting={reporting!r} -- 'not asked yet' is not 'nothing answered'",
+    )
+
+    # -- wayfinder #23: the last-message stamp sits before pong filtering -----
+    #
+    # The pongs are the only thing a healthy but idle hub reliably says: ten
+    # hardware runs with no manipulation produced zero EVENTs. Stamping after
+    # the filter would make the age climb without bound on a quiet house.
+    manager = _Manager(lambda: None, lambda _msg: None)
+    check(
+        "#23 the message age is unknown before the hub has said anything",
+        manager.seconds_since_last_message() is None,
+        "None, not 0.0 -- 'never heard' is not 'heard just now'",
+    )
+    manager.pending_ping_id = None
+    manager.incoming_json({"type": ResponseType.PONG, "transactionId": "no-match"})
+    age = manager.seconds_since_last_message()
+    check(
+        "#23 a pong the correlation rejects still stamps the message age",
+        age is not None and age < 1,
+        f"age={age!r} after an uncorrelatable pong "
+        "(the only traffic on an idle, healthy connection)",
+    )
+
+    check(
+        "#23 a rebuilt connection is counted, an attempt is not",
+        manager.reconnect_count == 0,
+        "0.6.0 retries a dead node ~6x/min with no backoff, so counting "
+        "attempts would measure the length of one outage, not the number",
+    )
+
+
     deako, _ = _stub_deako()
     deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
     fired = []
@@ -390,11 +582,14 @@ async def offline_checks() -> None:
         raised is None and manager.state_changes == 1,
         f"raised={raised!r}, sends={manager.state_changes}",
     )
+    # That command opened a witness window (wayfinder #23); this check is not
+    # about the detector, so close it rather than leave a timer running.
+    deako.void_pending_witnesses()
 
     # -- O10: a device that missed enumeration can still turn up -------------
     deako, _ = _stub_deako()
     announced_devices: list[str] = []
-    deako.set_device_added_callback(announced_devices.append)
+    deako.add_device_added_listener(announced_devices.append)
     deako.record_device("Late switch", NON_DIMMABLE_UUID, False, False, None)
     first_time = list(announced_devices)
     deako.record_device("Late switch", NON_DIMMABLE_UUID, False, True, None)
@@ -406,12 +601,28 @@ async def offline_checks() -> None:
     )
 
     deako, _ = _stub_deako()
-    deako.set_device_added_callback(None)
     deako.record_device("Late switch", NON_DIMMABLE_UUID, False, False, None)
     check(
         "O10 no listener is not an error",
         NON_DIMMABLE_UUID in deako.get_devices(),
         "the device is still recorded when nothing is listening",
+    )
+
+    # -- wayfinder #23: two platforms both hear about a late arrival ---------
+    # The single callback slot this replaced would have let whichever platform
+    # loaded second take the news away from the first, so the node status
+    # sensor and the light could never both have been built for a straggler.
+    deako, _ = _stub_deako()
+    heard_by_light: list[str] = []
+    heard_by_sensor: list[str] = []
+    deako.add_device_added_listener(heard_by_light.append)
+    deako.add_device_added_listener(heard_by_sensor.append)
+    deako.record_device("Late switch", NON_DIMMABLE_UUID, False, False, None)
+    check(
+        "#23 every device-added listener hears a first-time DEVICE_FOUND",
+        heard_by_light == [NON_DIMMABLE_UUID]
+        and heard_by_sensor == [NON_DIMMABLE_UUID],
+        f"light={heard_by_light}, sensor={heard_by_sensor}",
     )
 
 
@@ -531,6 +742,69 @@ async def live_checks(port: int, http_port: int) -> None:
             f"dim={dim!r} after an out-of-band change to 0%",
         )
 
+        # -- wayfinder #23 over the wire: the command-witness detector, against
+        #    the simulator's model of a registered-but-unreachable device.
+        #    Everything stays identical except the one thing that matters --
+        #    the acknowledgement still says "ok", and the EVENT never comes.
+        quirks.set_unreachable_devices({NON_DIMMABLE_UUID})
+        witness_budget = 2 * deako_module.WITNESS_WINDOW_S + 4
+
+        await client.control_device(NON_DIMMABLE_UUID, True)
+        await asyncio.sleep(1)
+        acked_but_unwitnessed = client.is_reachable(NON_DIMMABLE_UUID)
+
+        await asyncio.sleep(deako_module.WITNESS_WINDOW_S + 1)
+        await client.control_device(NON_DIMMABLE_UUID, False)
+        marked = await _wait_until(
+            lambda: not client.is_reachable(NON_DIMMABLE_UUID),
+            timeout=witness_budget,
+        )
+        check(
+            "#23 live: a switch that acks and never reports is marked unreachable",
+            acked_but_unwitnessed and marked,
+            "the hub acknowledged both commands with status ok, exactly as it "
+            "does for a switch that has been out of the wall for months",
+        )
+
+        state = client.get_state(NON_DIMMABLE_UUID)
+        check(
+            "#23 live: its cached state never moved either",
+            state["power"] is False,
+            f"state={state} -- the hub's cache is stale, never optimistic, so "
+            "the last confirmed value is what the integration still holds",
+        )
+
+        # And it comes back the moment the mesh speaks for it again. This is
+        # why the light entity stays available while its node reads
+        # unreachable: the next attempt is the cheapest thing that can clear
+        # the mark, and Home Assistant drops unavailable entities from service
+        # calls.
+        quirks.set_unreachable_devices(set())
+        await client.control_device(NON_DIMMABLE_UUID, True)
+        cleared = await _wait_until(
+            lambda: client.is_reachable(NON_DIMMABLE_UUID), timeout=15
+        )
+        check(
+            "#23 live: a later witnessed command clears the mark",
+            cleared,
+            "any EVENT for the device clears it, from any source",
+        )
+
+        reporting, expected, missing = client.get_last_sweep()
+        check(
+            "#23 live: the sweep is accounted for against the real stream",
+            (reporting, expected, missing) == (2, 2, []),
+            f"reporting={reporting}, expected={expected}, missing={missing}",
+        )
+
+        age = client.seconds_since_last_message()
+        check(
+            "#23 live: the hub's last message is timed",
+            age is not None and age < PING_WORKER_WAIT_S + 5,
+            f"age={age!r}s on a connection whose only idle traffic is pings "
+            f"every {PING_WORKER_WAIT_S}s",
+        )
+
         # -- O4 over the wire: the correlation is strict, so the risk it carries
         #    is the opposite of every other O4 check here -- not a dead
         #    connection going unnoticed, but a *live* one being dumped because
@@ -604,6 +878,20 @@ async def live_checks(port: int, http_port: int) -> None:
             "O7 live: the resync notified listeners rather than updating silently",
             len(updates) > 0,
             f"{len(updates)} callback(s) fired after reconnect",
+        )
+        reconnects = client.get_reconnect_count()
+        check(
+            "#23 live: the rebuilt connection was counted",
+            reconnects == 1,
+            f"reconnects={reconnects} after exactly one forced drop and "
+            "recovery",
+        )
+        reporting, expected, missing = client.get_last_sweep()
+        check(
+            "#23 live: the reconnect's resync is accounted for as a fresh sweep",
+            (reporting, expected, missing) == (2, 2, []),
+            f"reporting={reporting}, expected={expected}, missing={missing} "
+            "(O7's resync re-enumerates, so the sweep numbers refresh with it)",
         )
 
         await client.disconnect()

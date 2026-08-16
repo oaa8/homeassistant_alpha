@@ -72,6 +72,7 @@ def create_http_app(state: SimulatorState, config: Config, quirk_manager: QuirkM
         POST /api/control/latency - Set connection latency (T071)
         POST /api/control/withhold - Withhold devices from enumeration (#16)
         POST /api/control/deliver/{uuid} - Deliver a withheld device late (#16)
+        POST /api/control/unreachable - Model devices as off the mesh (#13/#23)
     """
     # Order matters: logging_middleware runs first (outermost), then error_middleware
     app = Application(middlewares=[logging_middleware, error_middleware])
@@ -96,9 +97,11 @@ def create_http_app(state: SimulatorState, config: Config, quirk_manager: QuirkM
         # wayfinder #16 (O10): enumeration shortfall and late arrival
         web.post('/api/control/withhold', set_withheld_devices),
         web.post('/api/control/deliver/{uuid}', deliver_device_late),
+        # wayfinder #13/#23: registered but off the mesh
+        web.post('/api/control/unreachable', set_unreachable_devices),
     ])
     
-    logger.info("HTTP API application created with 11 routes")
+    logger.info("HTTP API application created with 12 routes")
     return app
 
 
@@ -393,7 +396,15 @@ async def simulate_button_press(request: Request) -> Response:
     - Validated: toggle behavior, full state in EVENT
     - Validated: no conflicts with CONTROL commands
     - Validated: minimum ~430ms between physical button presses
-    
+
+    A device modelled as unreachable (wayfinder #13) is silent here too, and
+    that is not a shortcut. The house's `Master Closet Light` was physically
+    on while both hubs believed it off: an unreachable switch is invisible in
+    *both* directions, so a press on the wall reaches nobody. What the switch
+    is physically doing is deliberately not modelled, because nothing on this
+    protocol can observe it -- the hub's stale view is the whole story a
+    client ever gets.
+
     Example response:
         {
             "uuid": "11111111-1111-4111-8111-111111111111",
@@ -401,6 +412,7 @@ async def simulate_button_press(request: Request) -> Response:
         }
     """
     state = request.app[STATE_KEY]
+    quirk_manager = request.app[QUIRK_KEY]
     uuid = request.match_info['uuid']
     
     # Check device exists
@@ -410,7 +422,21 @@ async def simulate_button_press(request: Request) -> Response:
             text='{"error": "not_found", "message": "Device not found"}',
             content_type='application/json'
         )
-    
+
+    if quirk_manager.is_unreachable(uuid):
+        logger.info(
+            f"[http] Button press on unreachable device {uuid}: the mesh does "
+            "not hear it, so nothing changes and no EVENT is sent"
+        )
+        return web.json_response({
+            "uuid": device.uuid,
+            "state": {
+                "power": device.state.power,
+                "dim": device.state.dim
+            },
+            "unreachable": True,
+        })
+
     # Toggle power (FR-076: true→false, false→true)
     new_power = not device.state.power
     
@@ -783,6 +809,52 @@ async def deliver_device_late(request: Request) -> Response:
         "delivered": True,
         "was_withheld": was_withheld,
     })
+
+
+async def set_unreachable_devices(request: Request) -> Response:
+    """
+    POST /api/control/unreachable - Model devices as registered but off the mesh.
+
+    Request: {"uuids": ["<uuid>", ...]}  (an empty list makes everything
+    reachable again)
+    Response: {"status": "ok", "unreachable": ["<uuid>", ...]}
+
+    Purpose (wayfinder #13, #23): the house's real failure mode, and the only
+    fault in this simulator that models observed hub behaviour rather than
+    injecting something the hub does not do.
+
+    Such a device still enumerates in every sweep, still answers DEVICE_POLL
+    with its last known state, and still acknowledges CONTROL with
+    status "ok" -- it simply never emits the confirming EVENT, in either
+    direction. See QuirkManager.set_unreachable_devices for the measurements.
+    """
+    state = request.app[STATE_KEY]
+    quirk_manager = request.app[QUIRK_KEY]
+
+    try:
+        data = await request.json()
+    except (ValueError, KeyError) as e:
+        return web.json_response({"error": f"Invalid request: {e}"}, status=400)
+
+    uuids = data.get("uuids", [])
+    if not isinstance(uuids, list) or not all(isinstance(u, str) for u in uuids):
+        return web.json_response(
+            {"error": "uuids must be a list of strings"},
+            status=400
+        )
+
+    unknown = [u for u in uuids if state.get_device(u) is None]
+    if unknown:
+        return web.json_response(
+            {"error": "not_found", "message": f"Unknown devices: {unknown}"},
+            status=404
+        )
+
+    quirk_manager.set_unreachable_devices(set(uuids))
+
+    logger.info(f"[http] Control operation: unreachable devices {sorted(uuids)}")
+
+    return web.json_response({"status": "ok", "unreachable": sorted(uuids)})
 
 
 async def start_http_api(

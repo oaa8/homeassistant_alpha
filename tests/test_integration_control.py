@@ -184,17 +184,15 @@ async def test_control_power_on(simulator_port):
         poll_request = {
             "name": "DEVICE_POLL",
             "transactionId": "test-poll-001",
-            "data": {
-                "target": "11111111-1111-4111-8111-111111111111"
-            }
+            "target": "11111111-1111-4111-8111-111111111111"
         }
         await send_message(writer, poll_request)
 
         poll_response = await asyncio.wait_for(read_message(reader), timeout=1.0)
 
         # Validate state updated
-        assert poll_response["data"]["power"] is True, \
-            f"Expected power=True after control command but got {poll_response['data']['power']} - state not updated"
+        assert poll_response["data"]["state"]["power"] is True, \
+            f"Expected power=True after control command but got {poll_response['data']['state']['power']} - state not updated"
 
     finally:
         writer.close()
@@ -243,17 +241,15 @@ async def test_control_dim_level(simulator_port):
         poll_request = {
             "name": "DEVICE_POLL",
             "transactionId": "test-poll-002",
-            "data": {
-                "target": "22222222-2222-4222-8222-222222222222"
-            }
+            "target": "22222222-2222-4222-8222-222222222222"
         }
         await send_message(writer, poll_request)
 
         poll_response = await asyncio.wait_for(read_message(reader), timeout=1.0)
 
         # Validate dim level updated
-        assert poll_response["data"]["dim"] == 50, \
-            f"Expected dim=50 after control command but got {poll_response['data']['dim']} - brightness not updated"
+        assert poll_response["data"]["state"]["dim"] == 50, \
+            f"Expected dim=50 after control command but got {poll_response['data']['state']['dim']} - brightness not updated"
 
     finally:
         writer.close()
@@ -413,9 +409,7 @@ async def test_rate_limiting_silent_drop(simulator_port):
         poll_request = {
             "name": "DEVICE_POLL",
             "transactionId": "test-poll-rate",
-            "data": {
-                "target": "11111111-1111-4111-8111-111111111111"
-            }
+            "target": "11111111-1111-4111-8111-111111111111"
         }
         await send_message(writer, poll_request)
 
@@ -425,9 +419,9 @@ async def test_rate_limiting_silent_drop(simulator_port):
         assert poll_response["type"] == "DEVICE_POLL", \
             f"Expected DEVICE_POLL response but got {poll_response['type']}"
         
-        assert poll_response["data"]["power"] is True, \
+        assert poll_response["data"]["state"]["power"] is True, \
             f"Power should be True (first command) not False (second command was dropped) - first-in-wins behavior"
-        assert poll_response["data"]["dim"] == 75, \
+        assert poll_response["data"]["state"]["dim"] == 75, \
             f"Dim should be 75 (first command) not 25 (second command was dropped)"
 
     finally:

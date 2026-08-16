@@ -366,7 +366,7 @@ class TestTelnetContract:
                     "src": "test",
                     "dst": "deako",
                     "transactionId": "test-poll",
-                    "data": {"target": target},
+                    "target": target,
                 },
             )
             response = await recv(reader)
@@ -382,7 +382,7 @@ class TestTelnetContract:
                 "returning 'ok' would hide a quirk the integration must tolerate."
             )
             assert response["data"]["uuid"] == target
-            assert "power" in response["data"]
+            assert "power" in response["data"]["state"]
         finally:
             writer.close()
             await writer.wait_closed()

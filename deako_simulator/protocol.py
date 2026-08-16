@@ -318,49 +318,57 @@ def create_ping_response(transaction_id: str, client_name: str = "unknown") -> d
 
 def create_device_poll_response(device: Device, transaction_id: str, client_name: str = "unknown") -> dict[str, Any]:
     """Create DEVICE_POLL response message.
-    
-    QUIRK: Real hub returns status="error" even on successful poll (FR-023).
-    This matches hardware behavior validated 2025-10-18.
-    
+
+    The shape here is the one real hardware answers with, captured for the
+    first time in wayfinder #13 and written up in
+    research/protocol-reference-2026-08-15.md. Three things about it are
+    surprising and all three are real:
+
+    - ``status`` is ``"error"`` on success. Measured across 534 replies: 534
+      ``error``, zero ``ok``, including against a profile where all 37 devices
+      were confirmed reachable. It is a constant, not a signal -- branch on
+      whether ``data`` carries a device, never on ``status``.
+    - ``dst`` is ``"deako"``. The hub addresses *itself* rather than the client
+      that asked. Every other reply type addresses the client correctly.
+    - The device sits under ``data`` in the same shape ``DEVICE_FOUND`` uses --
+      ``name``, ``uuid``, ``capabilities`` as a ``power``/``power+dim`` string,
+      and a nested ``state`` -- not the flat body the vendor's doc implies.
+
     Args:
         device: Device to return state for
         transaction_id: Client-provided correlation ID
-        client_name: Client identifier from request 'src' field
-        
+        client_name: Ignored; present so every creator has the same signature
+
     Returns:
         DEVICE_POLL response dict
-        
-    Message format (QUIRK: status always "error"):
-    {
-        "type": "DEVICE_POLL",
-        "transactionId": "...",
-        "dst": "<client_name>",
-        "src": "deako",
-        "status": "error",  // QUIRK: Always "error", even on success
-        "data": {
-            "uuid": "...",
-            "name": "...",
-            "power": true/false,
-            "dim": 0-100 or null
-        },
-        "timestamp": <unix_ms>
-    }
-    
-    Research reference:
-    - FR-023: DEVICE_POLL quirk documented
-    - research/device-state-test-2025-10-18.md: Validated status="error" on success
+
+    What this reply is *not*: it is not a question put to the device. #13 raced
+    it against out-of-band changes made through a second hub, six transitions
+    over six, and the poll's answer never once led the ``EVENT`` -- it changes
+    the moment the event writes it and not before. So for a device that has
+    stopped being heard it keeps returning the last state it was told,
+    indefinitely, in exactly this shape.
     """
+    if "dim" in device.capabilities:
+        capabilities_str = "power+dim"
+    else:
+        capabilities_str = "power"
+
+    state: dict[str, Any] = {"power": device.state.power}
+    if "dim" in device.capabilities:
+        state["dim"] = device.state.dim
+
     return {
         "type": "DEVICE_POLL",
         "transactionId": transaction_id,
-        "dst": client_name,
+        "dst": "deako",  # QUIRK: the hub addresses itself, not the client
         "src": "deako",
-        "status": "error",  # QUIRK: Always "error", even on success (FR-023)
+        "status": "error",  # QUIRK: constant, never "ok" (534/534 replies)
         "data": {
-            "uuid": device.uuid,
             "name": device.name,
-            "power": device.state.power,
-            "dim": device.state.dim
+            "uuid": device.uuid,
+            "capabilities": capabilities_str,
+            "state": state,
         }
     }
 

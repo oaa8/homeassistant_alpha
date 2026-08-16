@@ -6,6 +6,7 @@ through pinging, and one to check for messages to send.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -77,6 +78,15 @@ class _Manager:
         # whenever they suspect the answer moved.
         self.on_connection_change = on_connection_change
         self.reported_connected = False
+        # DEVIATION (wayfinder #23): the two hub-level numbers the diagnostic
+        # entities report, kept here because this is the only place that sees
+        # every inbound message and every completed connection.
+        #
+        # A monotonic clock, not wall time: the age of the last message has to
+        # stay honest across an NTP correction or a suspend, and it is only
+        # ever read as a difference.
+        self.last_message_at: float | None = None
+        self.reconnect_count = 0
 
     async def init_connection(self) -> None:
         """Initialize the connection process."""
@@ -139,6 +149,14 @@ class _Manager:
         # enumeration burst on a hub with three dozen devices for nothing.
         was_reconnect = self.has_connected_before
         self.has_connected_before = True
+        if was_reconnect:
+            # DEVIATION (wayfinder #23): counted here rather than at the point
+            # the connection is dropped, so it counts connections that came
+            # back rather than attempts that were made. There is no backoff in
+            # 0.6.0 -- a dead node is retried about 6 times a minute (#19) --
+            # so a count of attempts would measure the length of one outage,
+            # not the number of them.
+            self.reconnect_count += 1
         if was_reconnect and self.on_connect is not None:
             await self.on_connect()
 
@@ -259,8 +277,27 @@ class _Manager:
                 self.create_connection_task()
                 break
 
+    def seconds_since_last_message(self) -> float | None:
+        """Return how long ago the hub last said anything, in seconds.
+
+        DEVIATION (wayfinder #23): None until the hub has said something at
+        all, which is a different fact from "it has been quiet for 0 seconds"
+        and must not be reported as one.
+        """
+        if self.last_message_at is None:
+            return None
+        return time.monotonic() - self.last_message_at
+
     def incoming_json(self, incoming_json: dict) -> None:
         """Handle incoming json."""
+        # DEVIATION (wayfinder #23): stamped at the inbound choke point,
+        # *before* the PONG filtering below, because the pongs are the only
+        # thing a healthy but idle hub reliably says. Stamping after the filter
+        # would make the age climb without bound on a house where nobody
+        # touches a light, which is the normal case -- ten hardware runs with
+        # no manipulation produced zero EVENTs (#10).
+        self.last_message_at = time.monotonic()
+
         response_type = incoming_json.get("type")
         if response_type == ResponseType.PONG:
             # DEVIATION (O4): only accept the pong that answers the ping

@@ -97,12 +97,13 @@ class QuirkManager:
         #
         # This is fault *injection*, not a model of hub behaviour: it produces
         # the observable "the count said N, only N-1 arrived", which is the
-        # only thing the availability model reacts to. How real firmware
-        # represents a switch it knows about but cannot reach is still an open
-        # question (wayfinder #13), so nothing here claims an answer to it --
-        # in particular, withheld devices are still counted, because dropping
-        # them from the count as well would be inventing a second behaviour.
+        # only thing the availability model reacts to.
         self._withheld_devices: set[str] = set()
+        # Devices that are registered but off the mesh (wayfinder #13, #23).
+        #
+        # This one *is* hub behaviour, measured against a switch that had been
+        # out of the wall for months. See set_unreachable_devices.
+        self._unreachable_devices: set[str] = set()
         
         logger.info(
             "QuirkManager initialized: whitespace=%s, delays=%s, malformed=%s",
@@ -223,9 +224,10 @@ class QuirkManager:
         full count, and one or more of the promised DEVICE_FOUND messages never
         arrives. That is the only observable the availability model reacts to.
 
-        This deliberately does not model a registered-but-unreachable switch;
-        what the real hub does in that case is still unanswered (wayfinder
-        #13). It injects a missing message, nothing more.
+        This is fault *injection* and nothing more. It is emphatically **not**
+        how a registered-but-unreachable switch behaves: wayfinder #13 settled
+        that question against real hardware, and such a device enumerates every
+        single sweep. See set_unreachable_devices for the real thing.
         """
         self._withheld_devices = set(uuids)
         logger.info(
@@ -233,6 +235,52 @@ class QuirkManager:
             len(self._withheld_devices),
             sorted(self._withheld_devices) or "none",
         )
+
+    def set_unreachable_devices(self, uuids: set[str]) -> None:
+        """Model registered-but-unreachable devices (wayfinder #13, #23).
+
+        Args:
+            uuids: Device uuids that are on the node's books but off the mesh.
+                Replaces any previous set.
+
+        Unlike everything else in this class, this is **not** injection of
+        behaviour the hub does not have. It is the observed behaviour of a real
+        switch that had been pulled out of the wall months earlier, measured
+        twice against firmware 3.21.9-prod-2025.232, and then found live in six
+        of the house's 37 devices.
+
+        Such a device:
+
+        - **still enumerates**, in its usual position, at the usual speed -- ten
+          sweeps across two days never once omitted one;
+        - **still answers DEVICE_POLL** with its last known state, because that
+          reads the node's own profile rather than the device;
+        - **still acknowledges CONTROL** with ``status: "ok"``, in about 110 ms;
+        - **never emits the EVENT**, in either direction -- neither for a
+          command sent to it nor for somebody pressing it on the wall. The
+          house's `Master Closet Light` was physically on while both hubs
+          believed it off.
+
+        That silence is the entire observable difference, and it is the whole
+        reason the integration's detector is a command that goes unwitnessed.
+
+        Two things a simulator must get right here or it lets the integration
+        pass a test the real hub fails: the acknowledgement has to be
+        ``status: "ok"`` rather than an error, and the device's cached state
+        must **not** move as a result. The real hub never optimistically
+        updates -- the dead switch still reported ``power: true`` after being
+        commanded off and acked. Cached state is stale, never invented.
+        """
+        self._unreachable_devices = set(uuids)
+        logger.info(
+            "Modelling %d device(s) as registered but unreachable: %s",
+            len(self._unreachable_devices),
+            sorted(self._unreachable_devices) or "none",
+        )
+
+    def is_unreachable(self, uuid: str) -> bool:
+        """Return whether this device is off the mesh (wayfinder #13)."""
+        return uuid in self._unreachable_devices
 
     def is_withheld(self, uuid: str) -> bool:
         """Return whether this device is currently being withheld."""

@@ -70,8 +70,10 @@ async def async_setup_entry(
     # Registered before the devices already in hand are added, so a straggler
     # arriving in between is picked up here rather than falling in the gap.
     # add_devices() dedupes, so whichever sees it first wins.
-    client.set_device_added_callback(device_reported)
-    config.async_on_unload(lambda: client.set_device_added_callback(None))
+    client.add_device_added_listener(device_reported)
+    config.async_on_unload(
+        lambda: client.remove_device_added_listener(device_reported)
+    )
 
     add_devices(list(client.get_devices()))
 
@@ -140,6 +142,21 @@ class DeakoLightEntity(LightEntity):
         O5, the map's known trap: with no connection there is no way to know
         what any light is doing, and reporting the last thing we heard is what
         made a dead integration look identical to a healthy one in history.
+
+        Deliberately *not* affected by the node's own reachability (wayfinder
+        #23). #10 wrote "the light goes unavailable when its node is
+        unreachable" while `unreachable` was still believed to be observed on
+        every sweep, and so self-clearing. #13 showed it is nothing of the
+        kind: the mark is raised by a command that goes unwitnessed and can
+        only be cleared by an EVENT. Home Assistant drops unavailable entities
+        from service calls, so greying the light out here would remove the
+        cheapest source of that EVENT -- the next attempt someone makes -- and
+        latch the light off for good. Roughly a sixth of this house is
+        unreachable right now, so that latch would not be a rare case.
+
+        `unavailable` was never the diagnosis anyway: the node status sensor on
+        this same device says which switch and, through its history, since
+        when.
         """
         return self.client.is_connected()
 

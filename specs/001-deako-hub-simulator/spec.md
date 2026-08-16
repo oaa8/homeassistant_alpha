@@ -451,7 +451,8 @@ As an integration developer, I want the simulator to provide detailed logging of
    - Response: `{"transactionId": "uuid", "type": "PING", ..., "status": "ok"}`
 
 6. **DEVICE_POLL**: Query individual device state
-   - Request: `{"transactionId": "uuid", "type": "DEVICE_POLL", "dst": "deako", "src": "client", "data": {"target": "device-uuid"}}`
+   - Request: `{"transactionId": "uuid", "type": "DEVICE_POLL", "dst": "deako", "src": "client", "target": "device-uuid"}`
+   - `target` sits at the **message root**. The `data.target` form and the bare form are answered with silence by real firmware, measured in wayfinder #13 — see `research/protocol-reference-2026-08-15.md`. The reply is typed `DEVICE_POLL`, carries `status: "error"` even on success, addresses itself as `dst: "deako"`, and holds the device under `data` in `DEVICE_FOUND`'s shape.
 
 **Device Capabilities**:
 - `"power"`: On/off only (switches, fans)
