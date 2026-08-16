@@ -237,12 +237,14 @@ class _Manager:
             # a late pong arriving in the next window could mask a dying
             # connection. Correlate on the transaction id that was sent.
             #
-            # The hub is not known for certain to echo transactionId on a PONG
-            # -- the simulator does, and it was built from observed hardware,
-            # but no capture proves it on the real firmware. So a PONG that
-            # carries no transaction id still counts. That is exactly stock
-            # behaviour, never worse; if the spare switch rig confirms the echo,
-            # the fallback can go.
+            # The correlation is strict: only the pong carrying this window's
+            # transaction id counts. The real firmware does echo it -- captured
+            # from the spare node, which answered
+            #   {"type":"PING","transactionId":"wf19-ping-0002",
+            #    "dst":"deako_watchdog_battery","src":"deako","status":"ok",...}
+            # -- so an uncorrelatable pong is not a hub we can prove is alive,
+            # and treating it as one would quietly restore the stock behaviour
+            # this deviation exists to prevent.
             ping = device_ping_request(source=self.client_name)
             self.pending_ping_id = ping.get("transactionId")
             self.pong_received = False
@@ -262,10 +264,15 @@ class _Manager:
         response_type = incoming_json.get("type")
         if response_type == ResponseType.PONG:
             # DEVIATION (O4): only accept the pong that answers the ping
-            # currently outstanding. See maintain_connection_worker for why an
-            # id-less pong is still accepted.
+            # currently outstanding. A pong with no transaction id answers
+            # nothing, and neither does any pong arriving before the first ping
+            # went out, when there is no outstanding id to answer. See
+            # maintain_connection_worker.
             transaction_id = incoming_json.get("transactionId")
-            if transaction_id is None or transaction_id == self.pending_ping_id:
+            if (
+                self.pending_ping_id is not None
+                and transaction_id == self.pending_ping_id
+            ):
                 self.pong_received = True
             else:
                 _LOGGER.debug(

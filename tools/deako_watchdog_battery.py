@@ -427,10 +427,10 @@ async def wait_until(
 async def phase_pong_echo(host: str, port: int, journal: Journal) -> None:
     """Does the real firmware echo transactionId on a PONG?
 
-    #14's pong-matching fix correlates the reply against the id sent, but
-    accepts an id-less pong because nothing proved the echo. Settling this is
-    seconds of hardware time and either deletes the fallback or leaves the
-    correlation knowingly inert.
+    #14's pong-matching fix correlated the reply against the id sent, but
+    accepted an id-less pong because nothing proved the echo. This phase
+    settled it: the echo is real, so wayfinder #22 deleted the fallback and
+    the correlation is now strict.
 
     Retried, because a node that has just woken accepts TCP before it is
     serving and resets the first connection -- observed on the first hardware
