@@ -809,45 +809,57 @@ class DeakoSimulator:
 
         return None
     
-    async def _handle_device_poll(self, message: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_device_poll(self, message: dict[str, Any]) -> dict[str, Any] | None:
         """
-        Handle DEVICE_POLL request per FR-017.
-        
+        Handle DEVICE_POLL request.
+
+        The request shape is the one real hardware answers, measured for the
+        first time in wayfinder #13 and written up in
+        research/protocol-reference-2026-08-15.md:
+
+            {"type":"DEVICE_POLL","target":"<uuid>", ...}
+
+        **`target` sits at the message root.** The `data.target` form -- which
+        the vendor documentation's structure implies, and which this simulator
+        used to be the only thing in the world that answered -- is met with
+        **silence** on hardware, as is a bare `DEVICE_POLL` with no target at
+        all. Answering those was letting a client pass a test the real hub
+        fails, so both are now silent here too.
+
+        The vendor doc is separately wrong about this verb in two other ways:
+        it types the request `PING` (a copy-paste error, and an expensive one,
+        since a `PING` shaped that way is just a hub ping) and it says the
+        reply is a `DEVICE_FOUND`. It is typed `DEVICE_POLL`.
+
         Args:
             message: Parsed DEVICE_POLL message dict
-            
+
         Returns:
-            DEVICE_POLL response dict with device state (or error)
-            
+            DEVICE_POLL response dict, an error response, or None for the
+            request forms hardware ignores.
+
         Error Handling:
-            - Missing 'uuid' field: REQUEST_MALFORMED (FR-066)
-            - Non-existent device UUID: REQUEST_INVALID (FR-066)
-            - Device not found message: "device could not be found"
-            
-        QUIRK: Returns status="error" even on successful query (FR-023)
-        
-        Research References:
-            - FR-017: DEVICE_POLL returns current device state
-            - FR-023: DEVICE_POLL returns status="error" on success (hardware quirk)
-            - FR-066: Error codes for validation failures
-            - research/device-state-test-2025-10-18.md: Validates status="error" quirk
+            - Root `target` naming an unknown device: REQUEST_INVALID with
+              "device could not be found" -- measured at 147.9 ms against a
+              well-formed uuid that cannot exist.
+            - No root `target`: silence, matching hardware.
         """
         from deako_simulator.protocol import create_device_poll_response, create_error_response
         
         transaction_id = message.get('transactionId', 'unknown')
         client_name = message.get('src', 'unknown')
-        
-        # Validate request structure - must have data.target field per FR-017
-        if 'data' not in message or 'target' not in message.get('data', {}):
-            return create_error_response(
-                transaction_id=transaction_id,
-                error_code="REQUEST_MALFORMED",
-                message="Missing required field: data.target",
-                message_type="DEVICE_POLL",
-                client_name=client_name
+
+        device_uuid = message.get('target')
+
+        if not isinstance(device_uuid, str) or not device_uuid:
+            # Silence, not an error. Hardware answers nothing at all to the
+            # bare form and to the data.target form, which is exactly why #19
+            # sent one and got a silence it could not interpret.
+            logger.debug(
+                "DEVICE_POLL with no root target; answering with silence as "
+                "hardware does"
             )
-        
-        device_uuid = message['data']['target']
+            return None
         
         # Get device from state
         device = self.state.get_device(device_uuid)
@@ -857,12 +869,14 @@ class DeakoSimulator:
             return create_error_response(
                 transaction_id=transaction_id,
                 error_code="REQUEST_INVALID",
-                message=f"device could not be found: {device_uuid}",
+                message="device could not be found",
                 message_type="DEVICE_POLL",
                 client_name=client_name
             )
-        
-        # Return device state with status="error" quirk per FR-023
+
+        # An unreachable device is polled exactly like a healthy one: this
+        # reads the node's own profile, never the device. See
+        # QuirkManager.set_unreachable_devices.
         return create_device_poll_response(device, transaction_id, client_name)
     
     async def _handle_control(
@@ -1048,10 +1062,21 @@ class DeakoSimulator:
         data = message['data']
         power = data.get('power')
         dim = data.get('dim')
-        
+
+        # wayfinder #13/#23: a registered-but-unreachable device is
+        # acknowledged and nothing else happens. Checked before the state
+        # update, because the two things that make this fault worth modelling
+        # are that the ack is a plain "ok" and that the cached state does not
+        # move -- the real hub never optimistically updates, so the dead switch
+        # in the house still reported power:true after being commanded off.
+        unreachable = self.quirk_manager.is_unreachable(device_uuid)
+
         # Update device state
         try:
-            updated_device = self.state.update_device_state(device_uuid, power, dim)
+            if unreachable:
+                updated_device = self.state.devices[device_uuid]
+            else:
+                updated_device = self.state.update_device_state(device_uuid, power, dim)
         except KeyError:
             # Device was removed - this shouldn't happen since we validated earlier
             logger.error(f"Device {device_uuid} disappeared during command processing")
@@ -1071,7 +1096,16 @@ class DeakoSimulator:
             # Client disconnected - log and continue
             logger.debug(f"Client {client_ip} disconnected during CONTROL response: {e}")
             return
-        
+
+        if unreachable:
+            # The entire observable difference, and the only honest signal in
+            # the protocol: the confirming EVENT never comes.
+            logger.info(
+                f"Device {device_uuid} is unreachable: acknowledged, state "
+                "unchanged, no EVENT will follow"
+            )
+            return
+
         # Spawn async task to broadcast EVENT after ~2s delay per research findings
         # Per research/physical-button-behavior-test-2025-10-18.md:
         # - EVENT broadcast occurs ~2 seconds after CONTROL acknowledgment

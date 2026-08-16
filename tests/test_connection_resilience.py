@@ -374,15 +374,13 @@ async def test_device_state_persistence_across_reconnection(simulator_for_resili
         poll_msg = {
             "name": "DEVICE_POLL",
             "transactionId": "state-persist-002",
-            "data": {
-                "target": device_uuid
-            }
+            "target": device_uuid
         }
         await send_message(writer1, poll_msg)
         
         poll_response = await read_response(reader1, timeout=2.0)
         assert poll_response is not None, "Should receive DEVICE_POLL response"
-        state_1 = poll_response.get("data", {})
+        state_1 = poll_response.get("data", {}).get("state", {})
         assert state_1.get("power") is True, "Power should be True"
         assert state_1.get("dim") == 75, "Dim should be 75"
         
@@ -404,15 +402,13 @@ async def test_device_state_persistence_across_reconnection(simulator_for_resili
         poll_msg = {
             "name": "DEVICE_POLL",
             "transactionId": "state-persist-003",
-            "data": {
-                "target": device_uuid
-            }
+            "target": device_uuid
         }
         await send_message(writer2, poll_msg)
         
         poll_response = await read_response(reader2, timeout=2.0)
         assert poll_response is not None, "Should receive DEVICE_POLL response"
-        state_2 = poll_response.get("data", {})
+        state_2 = poll_response.get("data", {}).get("state", {})
         
         # Verify state persisted
         assert state_2.get("power") is True, "Power should persist across reconnection"

@@ -279,10 +279,12 @@ class TestDevicePollResponse:
     """Test create_device_poll_response() function."""
     
     def test_device_poll_response_quirk(self):
-        """Validates FR-023: DEVICE_POLL returns status='error' on success.
-        
-        QUIRK: Real hub returns status="error" even for successful polls.
-        This is validated hardware behavior, not a bug in the simulator.
+        """Validates the DEVICE_POLL reply shape hardware actually answers.
+
+        Three surprises, all real and all measured in wayfinder #13:
+        `status` is "error" on success (534 replies, 534 error, zero ok),
+        `dst` is "deako" because the hub addresses itself, and the device
+        arrives under `data` in DEVICE_FOUND's shape rather than flattened.
         """
         device = Device(
             uuid="11111111-1111-4111-8111-111111111111",
@@ -296,10 +298,29 @@ class TestDevicePollResponse:
         assert response["type"] == "DEVICE_POLL"
         assert response["transactionId"] == "poll-001"
         assert response["status"] == "error", \
-            "DEVICE_POLL must return status='error' per FR-023 quirk"
+            "DEVICE_POLL must return status='error' even on success"
+        assert response["dst"] == "deako", \
+            "The hub addresses itself on this reply, not the client"
+        assert response["src"] == "deako"
         assert response["data"]["uuid"] == device.uuid
-        assert response["data"]["power"] is True
-        assert response["data"]["dim"] == 75
+        assert response["data"]["name"] == "Test Device"
+        assert response["data"]["capabilities"] == "power+dim"
+        assert response["data"]["state"]["power"] is True
+        assert response["data"]["state"]["dim"] == 75
+
+    def test_device_poll_response_power_only(self):
+        """A power-only device's state carries no dim key at all."""
+        device = Device(
+            uuid="33333333-3333-4333-8333-333333333333",
+            name="Hallway",
+            capabilities=["power"],
+            state=DeviceState(power=False)
+        )
+
+        response = create_device_poll_response(device, "poll-002")
+
+        assert response["data"]["capabilities"] == "power"
+        assert response["data"]["state"] == {"power": False}
 
 
 class TestErrorResponse:

@@ -229,56 +229,57 @@
     },
     "devicePollRequest": {
       "type": "object",
-      "description": "Client requests specific device state",
-      "required": ["type", "transactionId", "data"],
+      "description": "Client requests specific device state. The target sits at the message ROOT: hardware answers the data.target form, and the bare form, with silence (wayfinder #13).",
+      "required": ["type", "transactionId", "target"],
       "properties": {
         "type": {"const": "DEVICE_POLL"},
         "transactionId": {"type": "string"},
         "src": {"type": "string", "description": "Client identifier"},
         "dst": {"const": "deako"},
-        "data": {
-          "type": "object",
-          "required": ["target"],
-          "properties": {
-            "target": {
-              "type": "string",
-              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-              "description": "UUID of device to poll"
-            }
-          },
-          "additionalProperties": false
+        "target": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "description": "UUID of device to poll"
         }
       },
       "additionalProperties": true
     },
     "devicePollResponse": {
       "type": "object",
-      "description": "Hub returns device state (FR-023: always returns status=error even on success)",
+      "description": "Hub returns device state. Two quirks: status is always 'error' even on success (534/534 replies measured), and dst is 'deako' because the hub addresses itself.",
       "required": ["type", "transactionId", "status", "data", "timestamp"],
       "properties": {
         "type": {"const": "DEVICE_POLL"},
         "transactionId": {"type": "string"},
-        "dst": {"type": "string", "description": "Client identifier"},
+        "dst": {"const": "deako", "description": "QUIRK: the hub addresses itself, not the client"},
         "src": {"const": "deako"},
         "status": {
           "const": "error",
-          "description": "QUIRK: Real hub always returns 'error' even on success (FR-023)"
+          "description": "QUIRK: Real hub always returns 'error' even on success"
         },
         "data": {
           "type": "object",
-          "required": ["uuid", "name", "power"],
+          "required": ["uuid", "name", "capabilities", "state"],
           "properties": {
             "uuid": {
               "type": "string",
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
             },
             "name": {"type": "string"},
-            "power": {"type": "boolean", "description": "Current power state"},
-            "dim": {
-              "type": ["integer", "null"],
-              "minimum": 0,
-              "maximum": 100,
-              "description": "Current dim level (null if not dimmable)"
+            "capabilities": {"enum": ["power", "power+dim"]},
+            "state": {
+              "type": "object",
+              "required": ["power"],
+              "properties": {
+                "power": {"type": "boolean", "description": "Current power state"},
+                "dim": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 100,
+                  "description": "Current dim level; absent entirely for power-only devices"
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false

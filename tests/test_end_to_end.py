@@ -340,9 +340,8 @@ async def test_complete_integration_workflow(simulator_with_devices):
         poll_msg = {
             "name": "DEVICE_POLL",
             "transactionId": "test-poll-001",
-            "data": {
-                "target": devices[0].uuid  # DEVICE_POLL uses 'target' not 'uuid'
-            }
+            # `target` at the message root: the only form hardware answers
+            "target": devices[0].uuid
         }
         await send_message(writer, poll_msg)
         
@@ -350,12 +349,12 @@ async def test_complete_integration_workflow(simulator_with_devices):
         assert poll_response["type"] == "DEVICE_POLL", \
             f"Expected DEVICE_POLL response but got {poll_response['type']} - query failed"
         
-        # Verify state persisted (quirk: status="error" even on success per FR-023)
-        poll_data = poll_response["data"]
-        assert poll_data["power"] is True, \
-            f"Expected persisted power=true but got {poll_data['power']} - state not persisted"
-        assert poll_data["dim"] == 80, \
-            f"Expected persisted dim=80 but got {poll_data['dim']} - state not persisted"
+        # Verify state persisted (quirk: status="error" even on success)
+        poll_state = poll_response["data"]["state"]
+        assert poll_state["power"] is True, \
+            f"Expected persisted power=true but got {poll_state['power']} - state not persisted"
+        assert poll_state["dim"] == 80, \
+            f"Expected persisted dim=80 but got {poll_state['dim']} - state not persisted"
         
         # Step 7: Disconnect - Clean connection close
         writer.close()

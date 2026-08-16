@@ -237,7 +237,7 @@ async def test_scenario_activation_keeps_connections_active(simulator_with_scena
             "type": "DEVICE_POLL",
             "dst": "deako",
             "src": "test",
-            "data": {"target": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+            "target": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         }
         writer.write((json.dumps(poll_msg) + "\r\n").encode())
         await writer.drain()

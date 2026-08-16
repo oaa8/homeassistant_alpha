@@ -443,7 +443,7 @@ async def test_http_and_telnet_concurrent(simulator_with_http):
             "type": "DEVICE_POLL",
             "dst": "deako",
             "src": "test",
-            "data": {"target": device_uuid}
+            "target": device_uuid
         }
         writer.write((json.dumps(poll_msg) + "\r\n").encode())
         await writer.drain()

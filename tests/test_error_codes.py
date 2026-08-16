@@ -208,7 +208,7 @@ class TestRequestMalformed:
             message = {
                 "name": "DEVICE_POLL",
                 # Missing: "transactionId"
-                "data": {"target": "11111111-1111-4111-8111-111111111111"}
+                "target": "11111111-1111-4111-8111-111111111111"
             }
             await send_message(writer, message)
             
@@ -226,31 +226,33 @@ class TestRequestMalformed:
             await writer.wait_closed()
     
     async def test_missing_required_data_field(self, simulator: DeakoSimulator, config: Config):
-        """Validates REQUEST_MALFORMED for missing data.target (FR-066).
-        
-        End-user scenario: Integration sends DEVICE_POLL with data but no target UUID.
-        Expected: Receive error response with REQUEST_MALFORMED code.
-        Impact: Integration discovers required structure for commands.
+        """Validates that a DEVICE_POLL with no root target is ignored.
+
+        End-user scenario: Integration sends DEVICE_POLL without a target UUID
+        at the message root -- either omitted entirely, or placed under `data`
+        the way the vendor documentation's structure implies.
+        Expected: **silence**. Wayfinder #13 measured both forms against real
+        firmware and neither is answered at all, with an error or otherwise.
+        Impact: a client that expects an error here would hang against the real
+        hub, which is exactly what happened to wayfinder #19.
         """
         reader, writer = await connect_telnet(config.network.host, config.network.port)
         
         try:
-            # Send DEVICE_POLL with missing data.target
+            # Send DEVICE_POLL with the target in the place hardware ignores
             message = {
                 "name": "DEVICE_POLL",
                 "transactionId": "test-malformed-002",
-                "data": {}  # Missing: target field
+                "data": {"target": "11111111-1111-4111-8111-111111111111"}
             }
             await send_message(writer, message)
             
-            # Read error response
-            response = await asyncio.wait_for(read_message(reader), timeout=1.0)
-            
-            # Verify REQUEST_MALFORMED error
-            assert response["status"] == "error"
-            assert response["data"]["code"] == "REQUEST_MALFORMED"
-            assert "target" in response["data"]["message"].lower(), \
-                "Error message should mention missing target field"
+            with pytest.raises(asyncio.TimeoutError):
+                response = await asyncio.wait_for(read_message(reader), timeout=0.5)
+                pytest.fail(
+                    f"data.target DEVICE_POLL was answered with {response!r}; "
+                    "hardware answers it with silence"
+                )
         
         finally:
             writer.close()
@@ -344,9 +346,7 @@ class TestRequestInvalid:
             message = {
                 "name": "DEVICE_POLL",
                 "transactionId": "test-invalid-001",
-                "data": {
-                    "target": "99999999-9999-4999-8999-999999999999"  # Does not exist
-                }
+                "target": "99999999-9999-4999-8999-999999999999"  # Does not exist
             }
             await send_message(writer, message)
             

@@ -11,6 +11,26 @@ ICON = "mdi:format-quote-close"
 LIGHT = "light"
 PLATFORMS = [LIGHT]
 
+# The hub's own device, which the four hub-level diagnostic entities hang off
+# (wayfinder #23). Per-node diagnostics deliberately do not live here: the node
+# status sensor sits on the same device as its light, so "which switch, and
+# why" is answerable in one place rather than by cross-referencing.
+HUB_DEVICE_NAME = "Deako hub"
+HUB_DEVICE_MODEL = "Local integration"
+MANUFACTURER = "Deako"
+
+# Node status readings, in the order of how much they explain. `unreachable`
+# is command-triggered and cannot be discovered unasked; see the entity's own
+# documentation and wayfinder #13.
+NODE_STATUS_ONLINE = "online"
+NODE_STATUS_UNREACHABLE = "unreachable"
+NODE_STATUS_HUB_DISCONNECTED = "hub_disconnected"
+NODE_STATUS_OPTIONS = [
+    NODE_STATUS_ONLINE,
+    NODE_STATUS_UNREACHABLE,
+    NODE_STATUS_HUB_DISCONNECTED,
+]
+
 CONNECTION_ID = "connection_id"
 
 # The address of the hub is a safety control, not a convenience: the house has

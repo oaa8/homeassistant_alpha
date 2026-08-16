@@ -113,7 +113,7 @@ class TestLoggingAllMessageTypes:
         msg = {
             "type": "DEVICE_POLL",
             "transactionId": "test-poll",
-            "data": {"target": "12345678-1234-1234-1234-123456789abc"}
+            "target": "12345678-1234-1234-1234-123456789abc"
         }
         
         logger = get_logger("telnet")

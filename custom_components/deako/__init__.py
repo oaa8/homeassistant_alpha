@@ -19,7 +19,11 @@ from .pydeako.deako import Deako, FindDevicesError
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
-PLATFORMS: list[Platform] = [Platform.LIGHT]
+PLATFORMS: list[Platform] = [
+    Platform.LIGHT,
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
