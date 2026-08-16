@@ -253,6 +253,17 @@ class DeakoLastMessageAge(DeakoHubDiagnosticSensor):
     it changes continuously by doing nothing. Home Assistant's own poll
     interval does that, and it reads an in-memory clock: nothing here goes near
     the hub.
+
+    **A healthy connection makes this read a near-constant number, and that is
+    aliasing rather than a stuck entity.** Home Assistant samples every 30 s
+    and the watchdog pings every 10 s, so every sample lands on the same phase
+    of the ping cycle -- an end-to-end run against the simulator read exactly
+    3.3 s twice in a row. It is left that way deliberately: a flat baseline
+    makes any climb obvious on a graph, and the alternative is inventing a
+    cadence to break the harmonic with. What it means is that "the number is
+    moving" is never the evidence this entity is working; the evidence is that
+    it climbs when the hub goes quiet, which
+    ``wsl_validate_diagnostic_entities.sh`` phase 5 makes it do.
     """
 
     _attr_state_class = SensorStateClass.MEASUREMENT
