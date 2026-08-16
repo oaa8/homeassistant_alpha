@@ -1,8 +1,15 @@
 #!/bin/bash
 # Deploy the Deako integration into the LATEST Home Assistant and start it.
-# Auto-discovery is left to run: mirrored WSL networking means mDNS from the
-# simulator should reach HA, so the integration may be discovered rather than
-# configured by hand.
+#
+# The config is deliberately MINIMAL, not default_config. default_config pulls in
+# broad LAN discovery (Sonos, cast, DLNA...) and WSL mirrored networking puts the
+# real house on the other end of it: an earlier run of this script sat probing
+# house devices and never finished starting. Wayfinder #15 recorded that trap and
+# it was still live here. Only what the Deako test needs is enabled.
+#
+# Auto-discovery of the hub is NOT exercised: after this upgrade nothing calls the
+# discovery module and the configured address is the only source of an address, so
+# the config flow is driven by hand against the simulator's loopback address.
 set -e
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -16,7 +23,8 @@ rm -rf "$HA_DIR/custom_components/deako/__pycache__"
 find "$HA_DIR/custom_components/deako" -name '*.py' -exec sed -i 's/\r$//' {} \;
 
 cat > "$HA_DIR/configuration.yaml" <<'YAML'
-default_config:
+http:
+config:
 
 logger:
   default: warning

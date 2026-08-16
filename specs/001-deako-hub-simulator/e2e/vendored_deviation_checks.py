@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import pydeako  # noqa: E402
 from pydeako.deako import _deako as deako_module  # noqa: E402
 from pydeako.deako import Deako, DeviceCommandError, FindDevicesError  # noqa: E402
-from pydeako.deako._manager import _Manager  # noqa: E402
+from pydeako.deako._manager import _Manager, PING_WORKER_WAIT_S  # noqa: E402
 from pydeako.models import ResponseType, device_ping_request  # noqa: E402
 
 VENDORED_ROOT = REPO_ROOT / "custom_components" / "deako" / "pydeako"
@@ -529,6 +529,36 @@ async def live_checks(port: int, http_port: int) -> None:
             "O9 live: a hub-originated dim=0 is not discarded",
             dim == 0,
             f"dim={dim!r} after an out-of-band change to 0%",
+        )
+
+        # -- O4 over the wire: the correlation is strict, so the risk it carries
+        #    is the opposite of every other O4 check here -- not a dead
+        #    connection going unnoticed, but a *live* one being dumped because
+        #    its pong did not match. Nothing else in this suite would catch
+        #    that: the checks below all drop the connection deliberately, and a
+        #    watchdog that dumps everything passes them. So hold a healthy
+        #    connection across a full ping verdict and require it to be left
+        #    alone. Watch continuously rather than sampling the end, because a
+        #    dump followed by a reconnect looks identical afterwards.
+        watch_s = 2 * PING_WORKER_WAIT_S + 5
+        dropped_at: float | None = None
+        watch_start = asyncio.get_running_loop().time()
+        while asyncio.get_running_loop().time() - watch_start < watch_s:
+            await asyncio.sleep(0.5)
+            if not client.is_connected():
+                dropped_at = asyncio.get_running_loop().time() - watch_start
+                break
+        check(
+            "O4 live: a healthy connection survives a full ping verdict",
+            dropped_at is None,
+            f"held {watch_s}s (>= one ping + one verdict at "
+            f"PING_WORKER_WAIT_S={PING_WORKER_WAIT_S}s); "
+            + (
+                "never dropped"
+                if dropped_at is None
+                else f"DROPPED at {dropped_at:.1f}s -- strict correlation is "
+                "rejecting the hub's own pong"
+            ),
         )
 
         # -- O5 + O7 over the wire: drop the connection underneath the client,
