@@ -280,10 +280,21 @@ async def offline_checks() -> None:
     manager.pong_received = False
     manager.incoming_json({"type": ResponseType.PONG})
     check(
-        "O4 a pong with no transaction id still counts (stock behaviour)",
-        manager.pong_received is True,
-        "no capture proves the real firmware echoes transactionId, so the "
-        "fallback must never be worse than stock",
+        "O4 a pong with no transaction id does not count",
+        manager.pong_received is False,
+        "wayfinder #19 captured the real firmware echoing transactionId, so an "
+        "uncorrelatable pong proves nothing about this window",
+    )
+
+    # Nothing is outstanding before the first ping goes out, so nothing can
+    # answer it -- including a pong that also carries no id.
+    manager = _Manager(lambda: None, lambda _json: None)
+    manager.pong_received = False
+    manager.incoming_json({"type": ResponseType.PONG})
+    check(
+        "O4 an id-less pong does not match an id-less pending ping",
+        manager.pong_received is False,
+        "pending_ping_id starts None; None == None must not read as a match",
     )
 
     # -- O5: connection health ----------------------------------------------
