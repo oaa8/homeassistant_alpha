@@ -1,10 +1,16 @@
 #!/bin/bash
 # Fresh minimal instance of the LATEST Home Assistant, with no leftover config
-# entries from the earlier default_config run (which had adopted real LAN
+# entries from an earlier default_config run (which had adopted real LAN
 # devices and made the API slow).
+#
+# REPO is derived from this script's own location, never hardcoded: this file
+# used to name a specific worktree, so running it from any other worktree
+# deployed a DIFFERENT session's integration and validated that instead, while
+# reporting success. Sibling worktrees are live, so the path resolved and
+# nothing looked wrong.
 VENV="$HOME/ha-venv-latest"
 HA_DIR="$HOME/ha-test-latest"
-REPO="/mnt/c/Users/tolaa/Source/Repos/copilot-worktrees/homeassistant_alpha/oaa8-improved-enigma"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 pkill -f "ha-venv-latest/bin/hass" 2>/dev/null
 sleep 3
