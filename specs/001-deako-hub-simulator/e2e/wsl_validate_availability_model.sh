@@ -30,6 +30,10 @@
 # can discover a Deako node -- every connection made below came from the
 # configured address.
 #
+# Every port this script depends on is measured before it is used, and phase 4
+# measures the hub's port empty rather than assuming stopping the simulator
+# made it so -- see lib_port_guard.sh (wayfinder #24).
+#
 # Prerequisites: bash specs/001-deako-hub-simulator/e2e/wsl_setup_ha_latest.sh
 #
 # Usage (inside WSL):
@@ -39,13 +43,20 @@ set -uo pipefail
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$E2E_DIR/../../.." && pwd)"
+# shellcheck source=specs/001-deako-hub-simulator/e2e/lib_port_guard.sh
+. "$E2E_DIR/lib_port_guard.sh"
+
 HA_DIR="$HOME/ha-test-latest"
 VENV="$HOME/ha-venv-latest"
 WORK_DIR="${AVAILABILITY_WORK_DIR:-$HOME/availability-ha}"
-BASE="http://127.0.0.1:8123"
 SIM_IP="127.0.0.1"
-SIM_PORT="8023"
-SIM_HTTP="http://127.0.0.1:8080"
+HA_PORT="8123"
+BASE="http://127.0.0.1:$HA_PORT"
+
+# Ports are chosen at run time, not declared: see the port preconditions below.
+SIM_PORT=""
+SIM_HTTP_PORT=""
+SIM_HTTP=""
 
 DIMMER_UUID="11111111-1111-4111-8111-111111111111"
 SWITCH_UUID="33333333-3333-4333-8333-333333333333"
@@ -78,6 +89,18 @@ if [ ! -x "$VENV/bin/hass" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Port preconditions, measured before anything binds or connects. Both ports
+# the simulator binds can move out of a concurrent session's way; neither is
+# assumed free, because a Windows-side listener is reachable here through
+# mirrored networking and invisible to the socket table (wayfinder #24).
+# ---------------------------------------------------------------------------
+echo "== checking the ports this run depends on =="
+SIM_PORT=$(first_silent_port "$SIM_IP" "simulator telnet port" 8023 8024 8025 8026) || exit 1
+SIM_HTTP_PORT=$(first_silent_port "$SIM_IP" "simulator control port" 8080 8081 8082 8083) || exit 1
+SIM_HTTP="http://$SIM_IP:$SIM_HTTP_PORT"
+echo "  simulator $SIM_IP:$SIM_PORT, control $SIM_HTTP"
+
 SIM_PID=""
 cleanup() {
     [ -n "${SIM_PID:-}" ] && kill "$SIM_PID" 2>/dev/null
@@ -93,7 +116,7 @@ start_simulator() {
     "$WORK_DIR/venvsim/bin/pip" -q install aiohttp zeroconf jsonschema
     cd "$REPO_ROOT"
     "$WORK_DIR/venvsim/bin/python" "$E2E_DIR/zero_dim_sim_runner.py" \
-        --port "$SIM_PORT" --http-port 8080 > "$WORK_DIR/sim.log" 2>&1 &
+        --port "$SIM_PORT" --http-port "$SIM_HTTP_PORT" > "$WORK_DIR/sim.log" 2>&1 &
     SIM_PID=$!
     for _ in $(seq 1 30); do
         grep -q "^READY" "$WORK_DIR/sim.log" 2>/dev/null && break
@@ -110,6 +133,14 @@ stop_simulator() {
         sleep 1
     done
     SIM_PID=""
+    # Our process is gone, which is not the same as the port being empty -- the
+    # listening socket outlives the kill briefly, and something else entirely
+    # may be on that port. Phase 4's whole claim is "the hub is gone", so wait
+    # for the silence rather than assume it.
+    for _ in $(seq 1 15); do
+        port_answers "$SIM_IP" "$SIM_PORT" || break
+        sleep 1
+    done
 }
 
 deploy_integration() {
@@ -142,13 +173,18 @@ ha_http_code() {
 }
 
 start_ha() {
-    # Anything already serving 8123 is someone else's Home Assistant -- a
+    # Anything answering on 8123 is someone else's Home Assistant -- a
     # leftover from an aborted run, or another rig. Every check below would run
     # against it and pass or fail for unrelated reasons. This exact mistake
     # silently invalidated a whole run in wayfinder #15.
-    if [ "$(ha_http_code)" != "000" ]; then
-        echo "  something is already serving $BASE; refusing to test against it"
-        command -v ss >/dev/null && ss -ltnp 2>/dev/null | grep 8123
+    #
+    # A TCP probe rather than the HTTP check it used to be: curl reports 000
+    # for a non-HTTP listener as readily as for an empty port, and a
+    # Windows-side occupant never appears in `ss` here (wayfinder #24). 8123
+    # cannot relocate -- it is where hass serves -- so this one aborts.
+    if port_answers "127.0.0.1" "$HA_PORT"; then
+        echo "  something already answers on 127.0.0.1:$HA_PORT; refusing to test against it"
+        echo "  it is $(describe_port "127.0.0.1" "$HA_PORT")"
         return 1
     fi
 
@@ -362,6 +398,27 @@ RESYNC_STATE=$(ha_state "$DIMMER")
 echo ""
 echo "== phase 4: the hub is gone; commands must fail loudly =="
 stop_simulator
+
+# The precondition, measured rather than assumed, and measured once so the
+# report cannot describe a different probe than the one that decided. Everything
+# below reads as "the hub is gone", and none of it means that if something else
+# is answering on the hub's port -- a stranger there would keep the connection
+# alive and the lights available, or fail for a reason that has nothing to do
+# with this integration (wayfinder #24).
+HUB_PORT_STATE=$(port_state "$SIM_IP" "$SIM_PORT")
+case "$HUB_PORT_STATE" in
+    refused | silent)
+        HUB_PORT_DETAIL="$HUB_PORT_STATE (nothing answered)"
+        HUB_GONE=0
+        ;;
+    *)
+        HUB_PORT_DETAIL="$HUB_PORT_STATE -- $(port_occupant "$SIM_IP" "$SIM_PORT")"
+        HUB_GONE=1
+        ;;
+esac
+[ "$HUB_GONE" -eq 0 ]; report $? \
+    "nothing answers on the hub's port before anything is asked of it" \
+    "$SIM_IP:$SIM_PORT is $HUB_PORT_DETAIL"
 
 DOWN_S=$(wait_for_state "$DIMMER" "unavailable" 40)
 [ "$DOWN_S" != "-1" ]; report $? "a hub that vanished marks the lights unavailable" "after ${DOWN_S}s"

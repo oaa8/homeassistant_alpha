@@ -30,6 +30,10 @@
 # not exercised because after this ticket nothing discovers -- the configured
 # address is the only source of an address (outcome O8).
 #
+# Every port this script depends on is measured before it is used, and the ones
+# that can move do -- see lib_port_guard.sh for why an assumed-dead port turned
+# the O8 check green while it was testing nothing (wayfinder #24).
+#
 # Prerequisites: bash specs/001-deako-hub-simulator/e2e/wsl_setup_ha_latest.sh
 #
 # Usage (inside WSL):
@@ -39,13 +43,22 @@ set -uo pipefail
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$E2E_DIR/../../.." && pwd)"
+# shellcheck source=specs/001-deako-hub-simulator/e2e/lib_port_guard.sh
+. "$E2E_DIR/lib_port_guard.sh"
+
 HA_DIR="$HOME/ha-test-latest"
 VENV="$HOME/ha-venv-latest"
 WORK_DIR="${SETUP_REBUILD_WORK_DIR:-$HOME/setup-rebuild-ha}"
-BASE="http://127.0.0.1:8123"
 SIM_IP="127.0.0.1"
-SIM_PORT="8023"
-SIM_HTTP="http://127.0.0.1:8080"
+HA_PORT="8123"
+BASE="http://127.0.0.1:$HA_PORT"
+
+# Ports are chosen at run time, not declared: see the port preconditions below.
+SIM_PORT=""
+SIM_HTTP_PORT=""
+SIM_HTTP=""
+DEAD_PORT=""
+DEAD_ADDR=""
 
 DIMMER_UUID="11111111-1111-4111-8111-111111111111"
 SWITCH_UUID="33333333-3333-4333-8333-333333333333"
@@ -68,6 +81,22 @@ if [ ! -x "$VENV/bin/hass" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Port preconditions, measured before anything binds or connects.
+#
+# The two the simulator binds can move out of a neighbour's way; the one that
+# has to be empty is the load-bearing one, because an occupant there is what
+# made this whole check lie in wayfinder #24. Nothing here consults the socket
+# table -- see lib_port_guard.sh for why, and for what a probe can prove here.
+# ---------------------------------------------------------------------------
+echo "== checking the ports this run depends on =="
+SIM_PORT=$(first_silent_port "$SIM_IP" "simulator telnet port" 8023 8024 8025 8026) || exit 1
+SIM_HTTP_PORT=$(first_silent_port "$SIM_IP" "simulator control port" 8080 8081 8082 8083) || exit 1
+DEAD_PORT=$(first_silent_port "$SIM_IP" "the unreachable address" 8099 8098 8097 8096) || exit 1
+SIM_HTTP="http://$SIM_IP:$SIM_HTTP_PORT"
+DEAD_ADDR="$SIM_IP:$DEAD_PORT"
+echo "  simulator $SIM_IP:$SIM_PORT, control $SIM_HTTP, measured-empty $DEAD_ADDR"
+
 SIM_PID=""
 cleanup() {
     [ -n "${SIM_PID:-}" ] && kill "$SIM_PID" 2>/dev/null
@@ -83,7 +112,7 @@ start_simulator() {
     "$WORK_DIR/venvsim/bin/pip" -q install aiohttp zeroconf jsonschema
     cd "$REPO_ROOT"
     "$WORK_DIR/venvsim/bin/python" "$E2E_DIR/zero_dim_sim_runner.py" \
-        --port "$SIM_PORT" --http-port 8080 > "$WORK_DIR/sim.log" 2>&1 &
+        --port "$SIM_PORT" --http-port "$SIM_HTTP_PORT" > "$WORK_DIR/sim.log" 2>&1 &
     SIM_PID=$!
     for _ in $(seq 1 30); do
         grep -q "^READY" "$WORK_DIR/sim.log" 2>/dev/null && break
@@ -129,14 +158,20 @@ ha_http_code() {
 }
 
 start_ha() {
-    # Anything already serving 8123 means another Home Assistant -- a leftover
+    # Anything answering on 8123 means another Home Assistant -- a leftover
     # from an aborted run, or another rig entirely -- owns it. Every check below
     # would then run against someone else's instance and pass or fail for
     # reasons unrelated to this integration, so refuse rather than produce a
     # confident wrong answer.
-    if [ "$(ha_http_code)" != "000" ]; then
-        echo "  something is already serving $BASE; refusing to test against it"
-        command -v ss >/dev/null && ss -ltnp 2>/dev/null | grep 8123
+    #
+    # This is a TCP probe rather than the HTTP check it used to be, for two
+    # reasons: curl reports 000 for a non-HTTP listener as readily as for an
+    # empty port, and a Windows-side occupant never appears in `ss` at all
+    # (wayfinder #24). 8123 cannot relocate -- it is where hass serves and
+    # where every check below looks -- so this one aborts rather than moves.
+    if port_answers "127.0.0.1" "$HA_PORT"; then
+        echo "  something already answers on 127.0.0.1:$HA_PORT; refusing to test against it"
+        echo "  it is $(describe_port "127.0.0.1" "$HA_PORT")"
         return 1
     fi
 
@@ -161,7 +196,7 @@ stop_ha() {
     # The port outlives the process briefly, and starting the next phase while
     # it is still held is what makes a run silently test the wrong instance.
     for _ in $(seq 1 30); do
-        [ "$(ha_http_code)" = "000" ] && break
+        port_answers "127.0.0.1" "$HA_PORT" || break
         sleep 1
     done
 }
@@ -290,12 +325,17 @@ echo "$DUP" | grep -q "already_configured"; report $? \
     "a second entry for the same switch is refused" "$(echo "$DUP" | head -c 200)"
 
 # O8 again, the failure that matters: an address nobody can reach must say so,
-# not go looking for another node.
+# not go looking for another node. The port was measured empty at the top of
+# this run, and the assertion is coupled to the evidence rather than to the
+# entry state alone -- `setup_retry` on its own is satisfied by connecting to
+# something that is not a Deako hub and timing out later, which is exactly how
+# this check went green while testing nothing (wayfinder #24).
 UNREACHABLE_FLOW=$(curl -s -X POST "$BASE/api/config/config_entries/flow" -H "$AUTH" \
     -H "Content-Type: application/json" -d '{"handler":"deako","show_advanced_options":true}' \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('flow_id',''))")
 curl -s -X POST "$BASE/api/config/config_entries/flow/$UNREACHABLE_FLOW" -H "$AUTH" \
-    -H "Content-Type: application/json" -d '{"ip_address":"127.0.0.1","port":8099}' > "$WORK_DIR/unreachable.json"
+    -H "Content-Type: application/json" \
+    -d "{\"ip_address\":\"$SIM_IP\",\"port\":$DEAD_PORT}" > "$WORK_DIR/unreachable.json"
 sleep 25
 UNREACHABLE_STATE=$(curl -s "$BASE/api/config/config_entries/entry" -H "$AUTH" | python3 -c "
 import sys, json
@@ -303,12 +343,10 @@ entries = [e for e in json.load(sys.stdin) if e['domain'] == 'deako']
 other = [e for e in entries if e.get('state') != 'loaded']
 print(other[0]['state'] if other else 'none')
 ")
-[ "$UNREACHABLE_STATE" = "setup_retry" ]; report $? \
-    "an unreachable address retries with a clear error instead of finding another node" \
-    "state=$UNREACHABLE_STATE"
-
-CANNOT_REACH=$(grep -c "Cannot reach the Deako switch at 127.0.0.1:8099" "$HA_DIR/ha.log")
-[ "$CANNOT_REACH" -gt 0 ]; report $? "the failure names the address the user configured" "occurrences=$CANNOT_REACH"
+CANNOT_REACH=$(grep -c "Cannot reach the Deako switch at $DEAD_ADDR" "$HA_DIR/ha.log")
+[ "$UNREACHABLE_STATE" = "setup_retry" ] && [ "$CANNOT_REACH" -gt 0 ]; report $? \
+    "an unreachable address retries with the reachability error, naming the address" \
+    "state=$UNREACHABLE_STATE, 'Cannot reach the Deako switch at $DEAD_ADDR' x$CANNOT_REACH, port was $(describe_port "$SIM_IP" "$DEAD_PORT")"
 
 WRONG_NODE=$(grep -iE "discover|zeroconf|mdns" "$HA_DIR/ha.log" | grep -i "custom_components.deako" | head -3)
 [ -z "$WRONG_NODE" ]; report $? "the integration never went looking for a node" "${WRONG_NODE:-clean}"
@@ -487,8 +525,14 @@ fi
 
 # Editing the address has to actually rebind, because that is the safety
 # control: pointing the integration at a different node is how a user gets off
-# the node SmartThings is using. Proven by moving it to a port nothing serves
-# and watching it stop working, then moving it back.
+# the node SmartThings is using. Proven by moving it to a port measured empty at
+# the top of this run and watching it stop working, then moving it back.
+#
+# Coupled to the log the same way the flow check above is: a `setup_retry` that
+# arrives for some other reason -- including having connected to a stranger on
+# that port -- must not read as a successful rebind. The count is taken as a
+# delta because this Home Assistant has been restarted since the flow check, so
+# an absolute count says nothing about what this edit caused.
 edit_address() { # edit_address <ip> <port>
     local flow_id
     flow_id=$(curl -s -X POST "$BASE/api/config/config_entries/options/flow" -H "$AUTH" \
@@ -499,15 +543,17 @@ edit_address() { # edit_address <ip> <port>
         -H "Content-Type: application/json" -d "{\"ip_address\":\"$1\",\"port\":$2}" >/dev/null
 }
 
-edit_address "127.0.0.1" 8099
+REACH_BEFORE=$(grep -c "Cannot reach the Deako switch at $DEAD_ADDR" "$HA_DIR/ha.log")
+edit_address "$SIM_IP" "$DEAD_PORT"
 sleep 30
 MOVED_STATE=$(deako_entry state)
-[ "$MOVED_STATE" = "setup_retry" ]; report $? \
+REACH_AFTER=$(grep -c "Cannot reach the Deako switch at $DEAD_ADDR" "$HA_DIR/ha.log")
+[ "$MOVED_STATE" = "setup_retry" ] && [ "$REACH_AFTER" -gt "$REACH_BEFORE" ]; report $? \
     "editing the address rebinds the connection to the node the user named" \
-    "state=$MOVED_STATE after moving to a port nothing serves"
+    "state=$MOVED_STATE after moving to $DEAD_ADDR ($(describe_port "$SIM_IP" "$DEAD_PORT")), reachability errors ${REACH_BEFORE}->${REACH_AFTER}"
 
 MOVED_DATA=$(stored_entry data "$ENTRY_ID")
-echo "$MOVED_DATA" | grep -q '"port": 8099'; report $? \
+echo "$MOVED_DATA" | grep -q "\"port\": $DEAD_PORT"; report $? \
     "the edited address is stored in data, not options" "$MOVED_DATA"
 
 edit_address "$SIM_IP" "$SIM_PORT"
@@ -516,10 +562,11 @@ RESTORED_STATE=$(deako_entry state)
 [ "$RESTORED_STATE" = "loaded" ]; report $? \
     "editing it back reconnects, so the change is not one-way" "state=$RESTORED_STATE"
 
-# Two of the checks above deliberately point the integration at a port nothing
-# serves, and the vendored manager logs a connection timeout at ERROR when that
-# happens. Those lines are the expected result of this script's own probes, so
-# they are excluded by their exact text rather than by broadening the filter.
+# Two of the checks above deliberately point the integration at a port measured
+# empty at the top of this run, and the vendored manager logs a connection
+# timeout at ERROR when that happens. Those lines are the expected result of
+# this script's own probes, so they are excluded by their exact text rather
+# than by broadening the filter.
 BAD_LOG=$(grep -iE "custom_components\.deako" "$HA_DIR/ha.log" \
     | grep -iE "Traceback|ERROR|Exception" \
     | grep -viE "No socket to send data to|Cannot reach the Deako switch|Timeout attempting to connect|Full exception" \
