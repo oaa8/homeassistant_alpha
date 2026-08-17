@@ -43,7 +43,11 @@
 #   5. THE SWITCH  -- turning the probe off really stops automatic passes, and
 #                     the census button still works while it is off.
 #   6. RESTART     -- and the off answer survives a restart, because a setting
-#                     that quietly comes back looks respected and is not.
+#                     that quietly comes back looks respected and is not. So
+#                     does the attribution record, which is the harder half:
+#                     an unrestored entity is written back as `unknown` at
+#                     startup, so a restart would not pause the record, it
+#                     would put a false stretch through the middle of it.
 #   7. THE RETRY   -- the 30s retry brings the second miss forward so both land
 #                     inside a minute, and does *not* double-count into a false
 #                     mark: a device that answers the retry stays online and
@@ -793,11 +797,101 @@ RESTORED=$(ha_state "$PROBE_SWITCH")
     "the probe is still off after a restart" \
     "$PROBE_SWITCH=$RESTORED -- a setting that quietly comes back at the next restart looks respected and is not"
 
+# The attribution record has to survive too, and for a harder reason than
+# tidiness: an unrestored entity is written back as `unknown` at startup, so
+# the record would not merely pause across a restart -- it would gain a false
+# stretch saying nobody knew when this switch was last probed.
+R_PROBED=$(ha_state "$SWITCH_PROBED")
+R_VALUE=$(ha_state "$SWITCH_VALUE")
+R_DIM=$(ha_attr "$DIMMER_VALUE" dim)
+[ "$R_PROBED" != "unknown" ] && [ "$R_PROBED" != "unavailable" ] \
+    && [ "$R_VALUE" != "unknown" ] && [ "$R_VALUE" != "unavailable" ]
+report $? "the per-switch attribution record survives the restart" \
+    "$SWITCH_PROBED=$R_PROBED, $SWITCH_VALUE=$R_VALUE, and the level came back with it ($DIMMER_VALUE dim=$R_DIM)"
+
+R_PASS=$(ha_state "$LAST_PASS")
+R_ANSWERING=$(ha_state "$ANSWERING")
+R_NOT_ANSWERING=$(ha_state "$NOT_ANSWERING")
+[ "$R_PASS" != "unknown" ] && [ "$R_ANSWERING" != "unknown" ] \
+    && [ "$R_NOT_ANSWERING" != "unknown" ]
+report $? "so do the hub's census readings" \
+    "$LAST_PASS=$R_PASS answering=$R_ANSWERING not answering=$R_NOT_ANSWERING -- coming back as unknown would read as 'no pass has ever run', and would put a hole in a long-term statistic that never purges"
+
+# The check that actually matters, read out of the recorder rather than off
+# the state machine: once a real value has been written, no `unknown` may
+# appear after it.
+python3 -c "
+import json, subprocess, sys
+
+out = subprocess.run(
+    ['curl', '-s',
+     '$BASE/api/history/period?filter_entity_id=$SWITCH_PROBED,$SWITCH_VALUE,$LAST_PASS',
+     '-H', '$AUTH'],
+    capture_output=True, text=True).stdout
+try:
+    series = json.loads(out)
+except Exception as exc:
+    print(f'unreadable: {exc}')
+    sys.exit(1)
+
+holes = []
+for run in series:
+    seen_value = False
+    for point in run:
+        state = point.get('state')
+        if state not in (None, 'unknown', 'unavailable'):
+            seen_value = True
+        elif seen_value:
+            holes.append(f\"{point['entity_id']} went {state} at {point['last_changed'][11:19]}\")
+if holes:
+    print('; '.join(holes))
+    sys.exit(1)
+print('no entity fell back to unknown after it had a value')
+sys.exit(0)
+" > "$WORK_DIR/restart_history.txt"
+HISTORY_OK=$?
+report "$HISTORY_OK" "and the restart left no hole in the recorded record" \
+    "$(cat "$WORK_DIR/restart_history.txt") -- the record is read back weeks later to attribute a light that moved at three in the morning, and an unknown stretch across exactly the window somebody is asking about is the failure this pair exists to prevent"
+
 sleep $((FIRST_PASS_DELAY_S + 15))
 RESTART_CONTROLS_AFTER=$(controls_for "")
 [ "$RESTART_CONTROLS_AFTER" -eq "$RESTART_CONTROLS_BEFORE" ]
 report $? "and no startup pass slipped out before the restored answer landed" \
     "CONTROLs ${RESTART_CONTROLS_BEFORE}->${RESTART_CONTROLS_AFTER} across the startup delay"
+
+# The governor has to survive a restart too, and this is the case that would
+# otherwise be a hole in it: with the probe *on* and a pass only moments old,
+# a prober that starts with no memory finds nothing holding it back and writes
+# to the whole house fifteen seconds later. Restarting twice while looking into
+# something would then be two unguarded passes.
+echo "  now with the probe on, and a pass only moments old"
+call_service switch turn_on "$PROBE_SWITCH"
+GOV_MARK=$(ha_state "$LAST_PASS")
+call_service button press "$CENSUS_BUTTON"
+GOV_S=$(wait_for_change "$LAST_PASS" "$GOV_MARK" "$PASS_BUDGET_S")
+[ "$GOV_S" != "-1" ]; report $? "a census runs, so the last pass is recent" \
+    "$LAST_PASS=$(ha_state "$LAST_PASS")"
+
+GOV_PASS_BEFORE=$(ha_state "$LAST_PASS")
+GOV_CONTROLS_BEFORE=$(controls_for "")
+stop_ha
+start_ha || exit 1
+sleep $((FIRST_PASS_DELAY_S + 20))
+
+GOV_PASS_AFTER=$(ha_state "$LAST_PASS")
+GOV_CONTROLS_AFTER=$(controls_for "")
+[ "$GOV_CONTROLS_AFTER" -eq "$GOV_CONTROLS_BEFORE" ] \
+    && [ "$GOV_PASS_AFTER" = "$GOV_PASS_BEFORE" ]
+report $? "the governor survives the restart, so a restart is not a free pass" \
+    "CONTROLs ${GOV_CONTROLS_BEFORE}->${GOV_CONTROLS_AFTER} and last pass still $GOV_PASS_AFTER, ${FIRST_PASS_DELAY_S}s+ after a restart -- the prober took the interval back from the hub's own restored reading"
+
+grep -q "the next one is held for another" "$HA_DIR/ha.log"
+report $? "and it says how long it is holding the next pass" \
+    "$(grep -o "The last probe pass was [0-9]* s ago; the next one is held for another [0-9]* s" "$HA_DIR/ha.log" | tail -1)"
+
+# Back off for the retry phase, which measures individual commands.
+call_service switch turn_off "$PROBE_SWITCH"
+sleep 2
 
 # ---------------------------------------------------------------------------
 # Phase 7: the retry confirms a fault, and does not manufacture one.

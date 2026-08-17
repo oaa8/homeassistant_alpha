@@ -13,7 +13,8 @@ Wayfinder #26 adds the probe's own record: **last probed** and **last probe
 value** per switch, and **last probe pass** plus the two census counts on the
 hub. The per-switch pair is an attribution record rather than a diagnostic --
 see DeakoLastProbeValue for what it is for and why it cannot be left
-approximate.
+approximate, and DeakoRestoredProbeReading for why a restart must not put a
+hole in it.
 
 What the node status sensor honestly cannot say is set out on
 DeakoNodeStatus below. Read it before building anything on top of this.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import Any, Mapping
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -29,11 +31,13 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTime
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .binary_sensor import hub_device_info
 from .const import (
@@ -368,20 +372,62 @@ class DeakoDevicesReporting(DeakoHubDiagnosticSensor):
         self.schedule_update_ha_state()
 
 
-class DeakoProbeNodeSensor(SensorEntity):
+class DeakoRestoredProbeReading(RestoreEntity):
+    """Carry a probe reading across a restart.
+
+    **A restart must be invisible to this record**, and leaving it out was a
+    mistake the map owner caught. The argument for leaving it out was that the
+    recorder holds the history, so nothing is lost. That is wrong about what a
+    restart actually does: Home Assistant writes a *new* `unknown` state for
+    every unrestored entity as it comes up, so the record does not merely pause
+    -- it gains a false interval saying nobody knew when this switch was last
+    probed. We did know. It was in the previous row.
+
+    That matters more here than on an ordinary sensor. This pair exists to
+    attribute a light that moved with nobody asking, at three in the morning,
+    read back weeks later. An `unknown` stretch across the exact window
+    somebody is asking about is the failure this entity was built to prevent,
+    arriving by a different door.
+
+    Restoring invents nothing: the value written back is the one this
+    installation recorded, and a probe timestamp that is genuinely old still
+    reads old.
+    """
+
+    _restored_state: str | None = None
+    _restored_attributes: Mapping[str, Any] = {}
+
+    async def async_added_to_hass(self) -> None:
+        """Take back the last reading this installation recorded."""
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is None or last.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            return
+        self._restored_state = last.state
+        self._restored_attributes = last.attributes
+
+    def restored_timestamp(self) -> datetime | None:
+        """Return the restored reading as a datetime, if it parses."""
+        if self._restored_state is None:
+            return None
+        return dt_util.parse_datetime(self._restored_state)
+
+    def restored_count(self) -> int | None:
+        """Return the restored reading as a count, if it parses."""
+        if self._restored_state is None:
+            return None
+        try:
+            return int(float(self._restored_state))
+        except ValueError:
+            return None
+
+
+class DeakoProbeNodeSensor(SensorEntity, DeakoRestoredProbeReading):
     """Shared wiring for the per-switch probe records.
 
     On the same device as that switch's light and its node status, because
     those three are read together: what the probe last sent, when it sent it,
     and what the switch has been saying since.
-
-    **These read `unknown` after a restart until the next pass touches that
-    switch, and are deliberately not restored.** The record #25 asked for is
-    the *history* -- that is the stated reason it chose entities over log lines
-    -- and the history is intact: every write the probe ever made is in the
-    recorder with its own timestamp. Restoring the last value would put a
-    number on the dashboard that this process did not write, to close a gap in
-    which, by definition, nothing was written and so nothing needs attributing.
     """
 
     _attr_has_entity_name = True
@@ -412,7 +458,8 @@ class DeakoProbeNodeSensor(SensorEntity):
         return True
 
     async def async_added_to_hass(self) -> None:
-        """Listen for this device being probed."""
+        """Listen for this device being probed, and take back the last one."""
+        await super().async_added_to_hass()
         self.prober.add_device_listener(self.on_probe)
 
     async def async_will_remove_from_hass(self) -> None:
@@ -446,7 +493,10 @@ class DeakoLastProbed(DeakoProbeNodeSensor):
     @property
     def native_value(self) -> datetime | None:
         """Return when this switch was last probed, or None if never."""
-        return self.prober.get_probed_at(self.uuid)
+        probed = self.prober.get_probed_at(self.uuid)
+        if probed is not None:
+            return probed
+        return self.restored_timestamp()
 
 
 class DeakoLastProbeValue(DeakoProbeNodeSensor):
@@ -483,19 +533,27 @@ class DeakoLastProbeValue(DeakoProbeNodeSensor):
     def native_value(self) -> str | None:
         """Return the power state that was sent, or None if never probed."""
         value = self.prober.get_probe_value(self.uuid)
-        if value is None:
-            return None
-        power, _dim = value
-        return PROBE_VALUE_ON if power else PROBE_VALUE_OFF
+        if value is not None:
+            power, _dim = value
+            return PROBE_VALUE_ON if power else PROBE_VALUE_OFF
+        if self._restored_state in PROBE_VALUE_OPTIONS:
+            return self._restored_state
+        return None
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
         """Expose the brightness that went with it, if any."""
         value = self.prober.get_probe_value(self.uuid)
-        return {"dim": None if value is None else value[1]}
+        if value is not None:
+            return {"dim": value[1]}
+        if self._restored_state in PROBE_VALUE_OPTIONS:
+            # The level is half the reading, so it has to come back with it --
+            # `on` alone cannot say which brightness a light was driven to.
+            return {"dim": self._restored_attributes.get("dim")}
+        return {"dim": None}
 
 
-class DeakoProbePassSensor(DeakoHubDiagnosticSensor):
+class DeakoProbePassSensor(DeakoHubDiagnosticSensor, DeakoRestoredProbeReading):
     """Shared wiring for the hub-level probe readings."""
 
     def __init__(
@@ -506,7 +564,8 @@ class DeakoProbePassSensor(DeakoHubDiagnosticSensor):
         self.prober = prober
 
     async def async_added_to_hass(self) -> None:
-        """Update whenever a pass concludes."""
+        """Update whenever a pass concludes, and take back the last one."""
+        await super().async_added_to_hass()
         self.prober.add_pass_listener(self.on_pass)
 
     async def async_will_remove_from_hass(self) -> None:
@@ -533,7 +592,9 @@ class DeakoLastProbePass(DeakoProbePassSensor):
 
     It advances only on a pass that ran to the end. A pass abandoned when the
     hub went away is not a census, and recording it as one would hide exactly
-    the condition this is watching for.
+    the condition this is watching for. It survives a restart, for the same
+    reason: coming back as `unknown` would read as "no pass has ever run",
+    which is the one thing this entity must never say when it is not true.
     """
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
@@ -544,10 +605,22 @@ class DeakoLastProbePass(DeakoProbePassSensor):
         """Set up the timestamp."""
         super().__init__(prober, client, entry, "last_probe_pass")
 
+    async def async_added_to_hass(self) -> None:
+        """Update on each pass, and hand the restored one to the governor."""
+        await super().async_added_to_hass()
+        restored = self.restored_timestamp()
+        if restored is not None:
+            self.prober.seed_last_pass(restored)
+
     @property
     def native_value(self) -> datetime | None:
         """Return when the last completed pass finished."""
-        return self.prober.last_pass_at
+        last = self.prober.last_pass_at
+        if last is not None:
+            return last
+        # Only reachable if the restored value would not parse, in which case
+        # the governor did not take it either.
+        return self.restored_timestamp()
 
 
 class DeakoProbeWitnessed(DeakoProbePassSensor):
@@ -577,7 +650,10 @@ class DeakoProbeWitnessed(DeakoProbePassSensor):
     @property
     def native_value(self) -> int | None:
         """Return how many answered, or None before the first pass."""
-        return self.prober.witnessed
+        witnessed = self.prober.witnessed
+        if witnessed is not None:
+            return witnessed
+        return self.restored_count()
 
 
 class DeakoProbeUnwitnessed(DeakoProbePassSensor):
@@ -585,7 +661,9 @@ class DeakoProbeUnwitnessed(DeakoProbePassSensor):
 
     The one that matters, and the reason the pair is kept rather than a single
     count and a total: this is the house's mesh drop rate, sampled hourly, and
-    it has never been measured. Numeric for the same reason as its twin.
+    it has never been measured. Numeric for the same reason as its twin, and
+    restored across a restart for a reason that follows from being numeric:
+    an `unknown` gap is a hole in a long-term statistic that never purges.
     """
 
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -600,4 +678,7 @@ class DeakoProbeUnwitnessed(DeakoProbePassSensor):
     @property
     def native_value(self) -> int | None:
         """Return how many did not answer, or None before the first pass."""
-        return self.prober.unwitnessed
+        unwitnessed = self.prober.unwitnessed
+        if unwitnessed is not None:
+            return unwitnessed
+        return self.restored_count()

@@ -183,6 +183,44 @@ class DeakoProber:
         """When the last *completed* pass finished, or None if none has."""
         return self._last_pass_at
 
+    def seed_last_pass(self, when: datetime) -> None:
+        """Take back the last completed pass across a restart.
+
+        The governor's rule is "no automatic pass inside an hour of the last",
+        and without this a restart is a hole in it: the prober would start with
+        no memory, find nothing to hold it back, and write to all 37 devices
+        fifteen seconds later. Restarting Home Assistant twice while looking
+        into something would then be two unguarded passes -- which is the same
+        write storm the reconnect case exists to prevent, arriving through the
+        front door instead.
+
+        Seeded from the hub's own last-probe-pass entity, which Home Assistant
+        restores from the recorder, so the number is one this installation
+        wrote. A pass older than the interval leaves the startup delay alone
+        and simply falls due, which is the correct answer to "Home Assistant
+        was off all night".
+        """
+        if self._last_pass_at is not None:
+            return
+        age = (dt_util.utcnow() - when).total_seconds()
+        if age < 0:
+            # A restored stamp in the future means the clock moved, not that a
+            # pass is pending. Ignore it rather than defer for the difference.
+            _LOGGER.debug("Ignoring a restored probe pass dated in the future")
+            return
+        self._last_pass_at = when
+        remaining = PROBE_INTERVAL_S - age
+        if remaining > 0:
+            self._next_due = max(
+                self._next_due, time.monotonic() + remaining,
+            )
+            _LOGGER.info(
+                "The last probe pass was %i s ago; the next one is held for "
+                "another %i s",
+                age,
+                remaining,
+            )
+
     @property
     def witnessed(self) -> int | None:
         """How many devices answered for themselves in the last pass."""
