@@ -1,4 +1,4 @@
-"""Diagnostic sensors for Deako (wayfinder #23).
+"""Diagnostic sensors for Deako (wayfinder #23, extended by #26).
 
 Five entity types ship, and they answer different questions:
 
@@ -9,12 +9,19 @@ Five entity types ship, and they answer different questions:
   * **Reconnects since restart**, **seconds since last hub message** and
     **devices reporting**, on a device standing for the hub.
 
+Wayfinder #26 adds the probe's own record: **last probed** and **last probe
+value** per switch, and **last probe pass** plus the two census counts on the
+hub. The per-switch pair is an attribution record rather than a diagnostic --
+see DeakoLastProbeValue for what it is for and why it cannot be left
+approximate.
+
 What the node status sensor honestly cannot say is set out on
 DeakoNodeStatus below. Read it before building anything on top of this.
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -36,7 +43,12 @@ from .const import (
     NODE_STATUS_ONLINE,
     NODE_STATUS_OPTIONS,
     NODE_STATUS_UNREACHABLE,
+    PROBE_DATA,
+    PROBE_VALUE_OFF,
+    PROBE_VALUE_ON,
+    PROBE_VALUE_OPTIONS,
 )
+from .probe import DeakoProber
 from .pydeako.deako import Deako
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
@@ -49,12 +61,16 @@ async def async_setup_entry(
 ) -> None:
     """Configure the platform."""
     client: Deako = hass.data[DOMAIN][config.entry_id]
+    prober: DeakoProber = hass.data[PROBE_DATA][config.entry_id]
 
     add_entities(
         [
             DeakoHubReconnects(client, config),
             DeakoLastMessageAge(client, config),
             DeakoDevicesReporting(client, config),
+            DeakoLastProbePass(prober, client, config),
+            DeakoProbeWitnessed(prober, client, config),
+            DeakoProbeUnwitnessed(prober, client, config),
         ]
     )
 
@@ -66,7 +82,12 @@ async def async_setup_entry(
         if not new:
             return
         added.update(new)
-        add_entities([DeakoNodeStatus(client, uuid) for uuid in new])
+        entities: list[SensorEntity] = []
+        for uuid in new:
+            entities.append(DeakoNodeStatus(client, uuid))
+            entities.append(DeakoLastProbed(prober, client, uuid))
+            entities.append(DeakoLastProbeValue(prober, client, uuid))
+        add_entities(entities)
 
     @callback
     def device_reported(uuid: str) -> None:
@@ -105,13 +126,15 @@ class DeakoNodeStatus(SensorEntity):
     speed, `DEVICE_POLL` answers for it normally, and a `CONTROL` to a switch
     that has been out of the wall for months is still acknowledged
     `status: "ok"` in about 110 ms. Only the confirming `EVENT` tells the
-    truth, and it only exists once something has been asked for. So a node
-    nobody has touched for a week reads `online` because nothing has
-    contradicted it -- **this sensor cannot discover an unreachable switch, it
-    can only confirm one the moment someone reaches for it.**
+    truth, and it only exists once something has been asked for.
 
-    Which is when the house currently finds out too, except that today it
-    finds out silently and after this it says so.
+    Until wayfinder #26 that made this sensor blind between actuations: a node
+    nobody had touched for a week read `online` because nothing had
+    contradicted it. The active probe closes that gap by reaching for every
+    switch hourly on nobody's behalf, so a week of silence now means a week of
+    passes that were answered. What has not changed is where the evidence comes
+    from -- this still reports the absence of contradiction, and the probe's
+    job is to make sure a contradiction would have had the chance to arrive.
 
     The light on this same device deliberately stays available while this
     reads `unreachable`, so the next attempt can still be made -- and that
@@ -343,3 +366,238 @@ class DeakoDevicesReporting(DeakoHubDiagnosticSensor):
     def on_sweep(self) -> None:
         """Write the concluded sweep's numbers out."""
         self.schedule_update_ha_state()
+
+
+class DeakoProbeNodeSensor(SensorEntity):
+    """Shared wiring for the per-switch probe records.
+
+    On the same device as that switch's light and its node status, because
+    those three are read together: what the probe last sent, when it sent it,
+    and what the switch has been saying since.
+
+    **These read `unknown` after a restart until the next pass touches that
+    switch, and are deliberately not restored.** The record #25 asked for is
+    the *history* -- that is the stated reason it chose entities over log lines
+    -- and the history is intact: every write the probe ever made is in the
+    recorder with its own timestamp. Restoring the last value would put a
+    number on the dashboard that this process did not write, to close a gap in
+    which, by definition, nothing was written and so nothing needs attributing.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_should_poll = False
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, uuid: str, key: str,
+    ) -> None:
+        """Bind to one device."""
+        self.prober = prober
+        self.uuid = uuid
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{uuid}_{key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, uuid)},
+            name=client.get_name(uuid),
+            manufacturer=MANUFACTURER,
+        )
+
+    @property
+    def available(self) -> bool:
+        """Always available.
+
+        A record of what was written to a switch has to survive the switch
+        going quiet -- that is the case it exists for.
+        """
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        """Listen for this device being probed."""
+        self.prober.add_device_listener(self.on_probe)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        self.prober.remove_device_listener(self.on_probe)
+
+    @callback
+    def on_probe(self, uuid: str) -> None:
+        """One device was probed; ignore the other devices'."""
+        if uuid != self.uuid:
+            return
+        self.schedule_update_ha_state()
+
+
+class DeakoLastProbed(DeakoProbeNodeSensor):
+    """When the probe last wrote to this switch.
+
+    Half of the attribution record (wayfinder #25). On its own it answers "was
+    the integration writing to this light at 03:14?", which is the question
+    somebody asks after a light they did not touch was on when they got up.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, uuid: str,
+    ) -> None:
+        """Set up the timestamp."""
+        super().__init__(prober, client, uuid, "last_probed")
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return when this switch was last probed, or None if never."""
+        return self.prober.get_probed_at(self.uuid)
+
+
+class DeakoLastProbeValue(DeakoProbeNodeSensor):
+    """What the probe last sent to this switch.
+
+    The other half, and the one the accepted risk actually rests on.
+
+    The probe echoes each device's cached state back at it. If that cache was
+    wrong -- which needs a device that drifted while off the mesh and has since
+    come back -- the echo is a live command driving a light to a value nobody
+    asked for. **And the recorder would show nothing at all**, because the
+    light moves *to* the state Home Assistant already believes: `light.X` reads
+    `off` before and `off` after, with no state change to record.
+
+    So this pair is the only possible witness to the one hazard #25 chose to
+    accept rather than prevent. A reading that is plausible but not actually
+    what left the building defeats the entire arrangement, which is why it is
+    written at the send in probe.py rather than reconstructed from a summary.
+
+    The level rides as an attribute rather than as a second entity: brightness
+    is only meaningful alongside `on`, and this pair is already 74 entities.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = PROBE_VALUE_OPTIONS
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, uuid: str,
+    ) -> None:
+        """Bind to one device."""
+        super().__init__(prober, client, uuid, "last_probe_value")
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the power state that was sent, or None if never probed."""
+        value = self.prober.get_probe_value(self.uuid)
+        if value is None:
+            return None
+        power, _dim = value
+        return PROBE_VALUE_ON if power else PROBE_VALUE_OFF
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose the brightness that went with it, if any."""
+        value = self.prober.get_probe_value(self.uuid)
+        return {"dim": None if value is None else value[1]}
+
+
+class DeakoProbePassSensor(DeakoHubDiagnosticSensor):
+    """Shared wiring for the hub-level probe readings."""
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, entry: ConfigEntry, key: str,
+    ) -> None:
+        """Bind to the probe this entry owns."""
+        super().__init__(client, entry, key)
+        self.prober = prober
+
+    async def async_added_to_hass(self) -> None:
+        """Update whenever a pass concludes."""
+        self.prober.add_pass_listener(self.on_pass)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        self.prober.remove_pass_listener(self.on_pass)
+
+    @callback
+    def on_pass(self) -> None:
+        """Write the concluded pass's numbers out."""
+        self.schedule_update_ha_state()
+
+
+class DeakoLastProbePass(DeakoProbePassSensor):
+    """When the last probe pass completed.
+
+    This one exists to show the probe **stopping**, which no per-device record
+    can. The on/off switch can turn the probe off; if that happened and were
+    forgotten, every node status would read `online` and the house would look
+    perfectly healthy, because nothing would be reaching for anything to
+    contradict it. That is precisely the trap #3 caught in the act -- an
+    integration reporting itself healthy while doing nothing at all -- and a
+    timestamp that stops advancing is visible in a way that a log line which
+    stops appearing is not.
+
+    It advances only on a pass that ran to the end. A pass abandoned when the
+    hub went away is not a census, and recording it as one would hide exactly
+    the condition this is watching for.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, entry: ConfigEntry,
+    ) -> None:
+        """Set up the timestamp."""
+        super().__init__(prober, client, entry, "last_probe_pass")
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return when the last completed pass finished."""
+        return self.prober.last_pass_at
+
+
+class DeakoProbeWitnessed(DeakoProbePassSensor):
+    """How many devices answered in the last pass.
+
+    Numeric on purpose. This recorder keeps ordinary history for 60 days (#6),
+    but long-term statistics never purge -- so a number, unlike a status
+    string, still exists in five years. The drop rate is the thing #10 said
+    nobody knows, and this is the entity that outlives the retention window
+    long enough to answer it.
+
+    Counted as a census of the house rather than of the writes: a device the
+    passive detector already heard from this cycle is skipped by the pass and
+    still counts as answering, because a real actuation witnessed it and
+    writing to it again could only tell us what we know.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "devices"
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, entry: ConfigEntry,
+    ) -> None:
+        """Set up the count."""
+        super().__init__(prober, client, entry, "probe_witnessed")
+
+    @property
+    def native_value(self) -> int | None:
+        """Return how many answered, or None before the first pass."""
+        return self.prober.witnessed
+
+
+class DeakoProbeUnwitnessed(DeakoProbePassSensor):
+    """How many devices did not answer in the last pass.
+
+    The one that matters, and the reason the pair is kept rather than a single
+    count and a total: this is the house's mesh drop rate, sampled hourly, and
+    it has never been measured. Numeric for the same reason as its twin.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "devices"
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, entry: ConfigEntry,
+    ) -> None:
+        """Set up the count."""
+        super().__init__(prober, client, entry, "probe_unwitnessed")
+
+    @property
+    def native_value(self) -> int | None:
+        """Return how many did not answer, or None before the first pass."""
+        return self.prober.unwitnessed

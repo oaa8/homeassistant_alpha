@@ -241,6 +241,149 @@ async def offline_checks() -> None:
             and DIMMABLE_UUID not in deako.consecutive_misses,
             "the probe is the command that actually left",
         )
+
+        # -- wayfinder #26: the retry that brings the second miss forward ----
+        #
+        # 30s in production, so that both misses land inside a minute. The
+        # delay is a pacing question; what is checked here is that the retry
+        # happens at all, re-sends the command that was missed, and stops the
+        # moment it is answered. Each check sets the two windows it needs, so
+        # that what it is waiting for is legible rather than a race.
+        original_retry = deako_module.RETRY_DELAY_S
+        try:
+            deako_module.WITNESS_WINDOW_S = 0.05
+            deako_module.RETRY_DELAY_S = 0.05
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            reachability = []
+            deako.add_reachability_listener(
+                lambda uuid, reachable: reachability.append((uuid, reachable))
+            )
+            sends_before = manager.state_changes
+            await deako.control_device(DIMMABLE_UUID, False)
+            await asyncio.sleep(1)
+            check(
+                "#26 one unanswered command re-asks itself and then condemns",
+                manager.state_changes == sends_before + 2
+                and not deako.is_reachable(DIMMABLE_UUID)
+                and reachability == [(DIMMABLE_UUID, False)],
+                f"sends={manager.state_changes - sends_before} (the command "
+                f"and one retry), misses="
+                f"{deako.consecutive_misses.get(DIMMABLE_UUID)} -- without the "
+                "retry the second miss would wait for whenever somebody next "
+                "reached for this light, which for the hourly probe is an hour "
+                "and for a quiet house is weeks",
+            )
+
+            # The retry only ever confirms. A device that answers it is left
+            # alone, and its miss count is cleared rather than carried.
+            deako_module.WITNESS_WINDOW_S = 0.5
+            deako_module.RETRY_DELAY_S = 0.1
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            sends_before = manager.state_changes
+            await deako.control_device(DIMMABLE_UUID, False)
+            await asyncio.sleep(0.75)  # first miss at 0.5s, retry sent at 0.6s
+            retried = manager.state_changes == sends_before + 2
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+            })
+            await asyncio.sleep(0.2)
+            check(
+                "#26 a retry that is answered clears the count instead of "
+                "doubling it",
+                retried
+                and deako.is_reachable(DIMMABLE_UUID)
+                and DIMMABLE_UUID not in deako.consecutive_misses
+                and deako.pending_retry == {},
+                f"the retry went out={retried}, "
+                f"misses={deako.consecutive_misses} -- a device that answers "
+                "the second question is healthy, and must not carry the first "
+                "miss forward into a mark",
+            )
+
+            # A device already condemned has nothing left to confirm, so it is
+            # not written to again on the strength of a miss.
+            deako_module.WITNESS_WINDOW_S = 0.05
+            deako_module.RETRY_DELAY_S = 0.05
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            deako.unreachable.add(DIMMABLE_UUID)
+            sends_before = manager.state_changes
+            await deako.control_device(DIMMABLE_UUID, False)
+            await asyncio.sleep(1)
+            check(
+                "#26 a device already marked is not retried",
+                manager.state_changes == sends_before + 1
+                and deako.pending_retry == {},
+                f"sends={manager.state_changes - sends_before} (the command "
+                "only)",
+            )
+
+            # A newer command asks the question more directly than a retry of
+            # an older one ever could.
+            deako_module.WITNESS_WINDOW_S = 0.05
+            deako_module.RETRY_DELAY_S = 5
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            await deako.control_device(DIMMABLE_UUID, False)
+            await asyncio.sleep(0.3)  # first miss counted, retry pending
+            had_retry = DIMMABLE_UUID in deako.pending_retry
+            await deako.control_device(DIMMABLE_UUID, True)
+            check(
+                "#26 a superseding command cancels the pending retry",
+                had_retry and deako.pending_retry == {},
+                f"a retry was pending={had_retry}, and the new command took "
+                "the question over",
+            )
+
+            # Losing the socket takes the retries with the windows: a command
+            # sent into a dead connection is not a question the device heard.
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            await deako.control_device(DIMMABLE_UUID, False)
+            await asyncio.sleep(0.3)
+            had_retry = DIMMABLE_UUID in deako.pending_retry
+            manager.connected = False
+            deako.notify_connection_listeners(False)
+            await asyncio.sleep(0.2)
+            check(
+                "#26 losing the connection voids the pending retry too",
+                had_retry and deako.pending_retry == {},
+                f"a retry was pending={had_retry}; a send into a dead socket "
+                "is not evidence about a device",
+            )
+        finally:
+            deako_module.RETRY_DELAY_S = original_retry
+
+        # -- wayfinder #26: the witness clock the probe skips devices by ------
+        deako, _ = _stub_deako()
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+        check(
+            "#26 a device nothing has witnessed has no witness time",
+            deako.get_last_witness(DIMMABLE_UUID) is None,
+            "None is 'the mesh has never spoken for this device', which is the "
+            "normal state of a quiet house rather than a fault",
+        )
+        before = time.monotonic()
+        deako.incoming_json({
+            "type": "EVENT",
+            "data": {"target": DIMMABLE_UUID, "state": {"power": True}},
+        })
+        witnessed_at = deako.get_last_witness(DIMMABLE_UUID)
+        check(
+            "#26 an EVENT stamps when the mesh spoke for the device",
+            witnessed_at is not None and witnessed_at >= before,
+            f"witnessed_at={witnessed_at} -- the probe skips a device the "
+            "passive detector already confirmed this cycle, and that is a "
+            "question about time",
+        )
     finally:
         deako_module.WITNESS_WINDOW_S = original_window
 

@@ -14,7 +14,9 @@ from .const import (
     DEFAULT_PORT,
     DOMAIN,
     LEGACY_TELNET_DELAY,
+    PROBE_DATA,
 )
+from .probe import DeakoProber
 from .pydeako.deako import Deako, FindDevicesError
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
@@ -23,6 +25,8 @@ PLATFORMS: list[Platform] = [
     Platform.LIGHT,
     Platform.BINARY_SENSOR,
     Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.BUTTON,
 ]
 
 
@@ -85,12 +89,21 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    prober = hass.data.get(PROBE_DATA, {}).get(entry.entry_id)
+    if prober is not None:
+        # Before the connection goes, not after: a pass in flight would
+        # otherwise spend its remaining commands on a socket that is being
+        # torn down, and every one of them would be counted against a device
+        # for a fault that is ours.
+        await prober.stop()
+
     connection = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if connection is not None:
         await connection.disconnect()
 
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        hass.data.get(PROBE_DATA, {}).pop(entry.entry_id, None)
 
     return unload_ok
 
@@ -183,4 +196,14 @@ async def _initiate_connection(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = connection
 
+    # The probe is created before the platforms so the switch entity can find
+    # it, and started only after they are up. That order is load-bearing: the
+    # switch restores the last on/off answer in async_added_to_hass, and a
+    # governor already running could otherwise fire a startup pass on a house
+    # whose owner had turned the probe off.
+    prober = DeakoProber(connection)
+    hass.data.setdefault(PROBE_DATA, {})[entry.entry_id] = prober
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    prober.start()

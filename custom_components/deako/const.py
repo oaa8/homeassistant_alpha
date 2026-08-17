@@ -33,6 +33,20 @@ NODE_STATUS_OPTIONS = [
 
 CONNECTION_ID = "connection_id"
 
+# Where the active reachability probe hangs off hass.data (wayfinder #26).
+# A key of its own rather than a slot inside the domain's entry map, which
+# holds nothing but entry_id -> connection and is read that way by four
+# platforms.
+PROBE_DATA = f"{DOMAIN}_probe"
+
+# What the probe last wrote to a switch. `unknown` until it has written
+# anything, which is a different fact from having written `off` -- and the
+# difference matters, because this pair exists to attribute a light that moved
+# with nobody asking (wayfinder #25).
+PROBE_VALUE_ON = "on"
+PROBE_VALUE_OFF = "off"
+PROBE_VALUE_OPTIONS = [PROBE_VALUE_ON, PROBE_VALUE_OFF]
+
 # The address of the hub is a safety control, not a convenience: the house has
 # three Deako nodes, the telnet server is exclusive, and one of the other nodes
 # serves SmartThings. The configured address is the only source of an address --

@@ -2,6 +2,7 @@
 import asyncio
 
 import logging
+import time
 from typing import Any, Callable
 
 from ..models import ResponseType
@@ -85,6 +86,22 @@ WITNESS_WINDOW_S = 5
 # entity deliberately stays available while its node reads `unreachable`.
 MISSES_TO_UNREACHABLE = 2
 
+# DEVIATION (wayfinder #25/#26): bring the second miss forward.
+#
+# #23 left "two consecutive misses" meaning two misses whenever they happened
+# to occur -- which, for a switch nobody touches, could be months apart, and
+# for the hourly probe would be two cadences apart. Two misses an hour apart do
+# not describe one fault; they describe two, and in between the device may have
+# come back and gone again. A single retry puts both misses inside a minute,
+# which is what the rule was written to mean.
+#
+# It re-sends the command that was missed rather than the current cached state,
+# because the cache did not move -- no EVENT arrived, which is the whole
+# premise -- so echoing it would ask for something nobody asked for. Sent once
+# per command, never for a device already marked (there is nothing left to
+# confirm), and cancelled by anything that answers the question first.
+RETRY_DELAY_S = 30
+
 
 class Deako:
     """Deako specific socket api."""
@@ -139,6 +156,16 @@ class Deako:
         self.unreachable: set[str] = set()
         self.consecutive_misses: dict[str, int] = {}
         self.pending_witness: dict[str, asyncio.Task] = {}
+        # DEVIATION (wayfinder #26): when the mesh last spoke for each device,
+        # on the monotonic clock. The probe skips a device the passive detector
+        # has already confirmed this cycle, and "already confirmed" is a
+        # question about time, so the answer has to be kept rather than
+        # inferred from the miss counters -- those are cleared by a witness and
+        # so cannot say when it happened.
+        self.last_witness: dict[str, float] = {}
+        # DEVIATION (wayfinder #26): the retries that bring a second miss
+        # forward. See RETRY_DELAY_S.
+        self.pending_retry: dict[str, asyncio.Task] = {}
 
     def add_connection_listener(
         self, listener: Callable[[bool], None],
@@ -436,7 +463,10 @@ class Deako:
             self.sweep_timer.cancel()
             self.sweep_timer = None
 
-    def watch_for_witness(self, uuid: str) -> None:
+    def watch_for_witness(
+        self, uuid: str, power: bool | None = None, dim: int | None = None,
+        is_retry: bool = False,
+    ) -> None:
         """Start the window in which a command has to be witnessed.
 
         DEVIATION (wayfinder #23). A second command to the same device
@@ -444,15 +474,25 @@ class Deako:
         always "was the most recent thing we asked for carried out", and the
         acknowledgement cannot answer it -- the hub answers `status: "ok"` in
         ~110ms for a device that has been out of the wall for months.
+
+        The command itself is carried into the window (wayfinder #26) so a
+        first miss can be retried with the thing that was actually asked for.
+        A superseding command cancels any retry the previous one had pending:
+        that retry exists to confirm a miss, and a newer command asks the
+        question again more directly.
         """
         existing = self.pending_witness.pop(uuid, None)
         if existing is not None:
             existing.cancel()
+        self.cancel_retry(uuid)
         self.pending_witness[uuid] = asyncio.create_task(
-            self.witness_window(uuid)
+            self.witness_window(uuid, power, dim, is_retry)
         )
 
-    async def witness_window(self, uuid: str) -> None:
+    async def witness_window(
+        self, uuid: str, power: bool | None = None, dim: int | None = None,
+        is_retry: bool = False,
+    ) -> None:
         """Count a miss if the commanded change is never witnessed."""
         await asyncio.sleep(WITNESS_WINDOW_S)
         self.pending_witness.pop(uuid, None)
@@ -465,8 +505,8 @@ class Deako:
             misses,
             MISSES_TO_UNREACHABLE,
         )
-        if misses >= MISSES_TO_UNREACHABLE and uuid in self.devices:
-            if uuid not in self.unreachable:
+        if misses >= MISSES_TO_UNREACHABLE:
+            if uuid in self.devices and uuid not in self.unreachable:
                 self.unreachable.add(uuid)
                 _LOGGER.warning(
                     "%s is unreachable: %i commanded changes in a row were "
@@ -475,6 +515,71 @@ class Deako:
                     misses,
                 )
                 self.notify_reachability_listeners(uuid, False)
+            return
+
+        # DEVIATION (wayfinder #26): a first miss on a device nothing has
+        # condemned yet gets its second miss asked for now rather than whenever
+        # somebody next reaches for that light. Never after a retry's own miss:
+        # that one either marks the device above or leaves the count where a
+        # third command would be a third question, not a confirmation.
+        if not is_retry and power is not None and uuid not in self.unreachable:
+            self.schedule_retry(uuid, power, dim)
+
+    def schedule_retry(
+        self, uuid: str, power: bool, dim: int | None,
+    ) -> None:
+        """Re-ask, once, in RETRY_DELAY_S (DEVIATION, wayfinder #26)."""
+        self.cancel_retry(uuid)
+        self.pending_retry[uuid] = asyncio.create_task(
+            self.retry_command(uuid, power, dim)
+        )
+
+    async def retry_command(
+        self, uuid: str, power: bool, dim: int | None,
+    ) -> None:
+        """Send the missed command again, so the second miss lands now.
+
+        DEVIATION (wayfinder #26). Three things can make this pointless
+        between being scheduled and firing, and all three are checked rather
+        than assumed: the device answered (the mark is gone and so is this
+        task, cancelled by witness_device), the device was condemned by some
+        other route, or the hub went away -- in which case a send would fail
+        and, worse, a failed send is not evidence about the device.
+        """
+        await asyncio.sleep(RETRY_DELAY_S)
+        self.pending_retry.pop(uuid, None)
+        if uuid in self.unreachable:
+            return
+        if not self.is_connected():
+            _LOGGER.debug(
+                "Not retrying %s: there is no connection to the hub", uuid,
+            )
+            return
+        _LOGGER.info(
+            "Re-sending the unwitnessed command to %s to confirm the miss",
+            uuid,
+        )
+        sent = await self.connection_manager.send_state_change(uuid, power, dim)
+        if not sent:
+            _LOGGER.warning("Could not re-send the command to %s", uuid)
+            return
+        self.watch_for_witness(uuid, power, dim, is_retry=True)
+
+    def cancel_retry(self, uuid: str) -> None:
+        """Drop a pending retry for this device (wayfinder #26)."""
+        pending = self.pending_retry.pop(uuid, None)
+        if pending is not None:
+            pending.cancel()
+
+    def get_last_witness(self, uuid: str) -> float | None:
+        """Return when the mesh last spoke for this device, or None.
+
+        DEVIATION (wayfinder #26). On the monotonic clock, so it is only ever
+        read as a difference and survives an NTP correction. None means nothing
+        has ever witnessed this device in this process -- which is the normal
+        state of a quiet house, not a fault.
+        """
+        return self.last_witness.get(uuid)
 
     def witness_device(self, uuid: str) -> None:
         """Record that the mesh has spoken for this device (wayfinder #23).
@@ -483,9 +588,13 @@ class Deako:
         somebody pressing the switch on the wall. All three prove the same
         thing: something reached this device and it answered for itself.
         """
+        self.last_witness[uuid] = time.monotonic()
         pending = self.pending_witness.pop(uuid, None)
         if pending is not None:
             pending.cancel()
+        # A retry only exists to confirm a miss, and this is the answer it was
+        # waiting for (wayfinder #26).
+        self.cancel_retry(uuid)
         self.consecutive_misses.pop(uuid, None)
         if uuid in self.unreachable:
             self.unreachable.discard(uuid)
@@ -498,10 +607,18 @@ class Deako:
         The marks already made survive -- they are about the devices, not
         about this socket -- but a window that was still open proves nothing
         now, because we would not have heard the EVENT either way.
+
+        The retries go with them (wayfinder #26): a retry is a command, and a
+        command sent into a dead socket is not a question the device ever
+        heard. The next connection re-enumerates and the probe's own governor
+        decides when to ask again.
         """
         for task in self.pending_witness.values():
             task.cancel()
         self.pending_witness = {}
+        for task in self.pending_retry.values():
+            task.cancel()
+        self.pending_retry = {}
 
     async def connect(self) -> None:
         """Initiate the connection sequence."""
@@ -621,8 +738,9 @@ class Deako:
 
         # DEVIATION (wayfinder #23): the command that just left is the probe.
         # Started only once the bytes are away, so a send that never happened
-        # is not counted against the device.
-        self.watch_for_witness(uuid)
+        # is not counted against the device. The command travels with the
+        # window (wayfinder #26) so a first miss can be re-asked.
+        self.watch_for_witness(uuid, power, dim)
 
     def get_name(self, uuid: str) -> str | None:
         """Get a device's name by uuid."""

@@ -58,6 +58,35 @@
       },
       "devices_reporting": {
         "name": "Devices reporting"
+      },
+      "last_probed": {
+        "name": "Last probed"
+      },
+      "last_probe_value": {
+        "name": "Last probe value",
+        "state": {
+          "on": "On",
+          "off": "Off"
+        }
+      },
+      "last_probe_pass": {
+        "name": "Last probe pass"
+      },
+      "probe_witnessed": {
+        "name": "Devices answering last probe"
+      },
+      "probe_unwitnessed": {
+        "name": "Devices not answering last probe"
+      }
+    },
+    "switch": {
+      "probe_enabled": {
+        "name": "Reachability probe"
+      }
+    },
+    "button": {
+      "run_census": {
+        "name": "Run census now"
       }
     }
   }
