@@ -16,6 +16,10 @@ see DeakoLastProbeValue for what it is for and why it cannot be left
 approximate, and DeakoRestoredProbeReading for why a restart must not put a
 hole in it.
 
+Wayfinder #39 adds **unacknowledged commands** on the hub: commands the hub
+never answered at all. It is deliberately a different question from the node
+status sensor's -- see DeakoDroppedCommands.
+
 What the node status sensor honestly cannot say is set out on
 DeakoNodeStatus below. Read it before building anything on top of this.
 """
@@ -70,6 +74,7 @@ async def async_setup_entry(
     add_entities(
         [
             DeakoHubReconnects(client, config),
+            DeakoDroppedCommands(client, config),
             DeakoLastMessageAge(client, config),
             DeakoDevicesReporting(client, config),
             DeakoLastProbePass(prober, client, config),
@@ -262,6 +267,50 @@ class DeakoHubReconnects(DeakoHubDiagnosticSensor):
     @callback
     def on_connection_change(self, connected: bool) -> None:
         """Write the new count out."""
+        self.schedule_update_ha_state()
+
+
+class DeakoDroppedCommands(DeakoHubDiagnosticSensor):
+    """Commands the hub never acknowledged, since startup.
+
+    The instrument for a question this map has deferred rather than answered
+    (wayfinder #37/#39). 0.3.1 held commands 500ms apart through a send queue;
+    0.6.0 deleted the queue and spaces nothing, against a hub that silently
+    drops commands arriving under ~100ms apart. Whether the house is losing
+    scene commands right now is unmeasured, and this is what measures it.
+
+    It counts one thing only: a `CONTROL` we sent and the hub never answered.
+    A switch that was commanded and did not move is a different fault and is
+    reported by its own node status sensor. Conflating them is what the
+    integration did before this shipped.
+
+    An entity rather than an attribute, deliberately: the recorder keeps 60
+    days here while long-term statistics never purge (#6), and this number has
+    to accumulate across a window longer than anyone will sit and watch.
+    """
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, client: Deako, entry: ConfigEntry) -> None:
+        """Set up the counter."""
+        super().__init__(client, entry, "dropped_commands")
+
+    @property
+    def native_value(self) -> int:
+        """Return the count since this entry was set up."""
+        return self.client.get_dropped_command_count()
+
+    async def async_added_to_hass(self) -> None:
+        """Write the count out whenever it moves."""
+        self.client.add_drop_listener(self.on_drop)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        self.client.remove_drop_listener(self.on_drop)
+
+    @callback
+    def on_drop(self) -> None:
+        """Publish the new count."""
         self.schedule_update_ha_state()
 
 

@@ -331,13 +331,23 @@ class _Manager:
         uuid,
         power,
         dim=None,
+        transaction_id: str | None = None,
         completed_callback: Callable | None = None,
     ) -> bool:
-        """Send a state change request, reporting whether it was sent."""
+        """Send a state change request, reporting whether it was sent.
+
+        DEVIATION (wayfinder #39): the transaction id is now the caller's to
+        choose. Stock minted one inside `state_change_request()` with `uuid4()`
+        and threw it away, which made the acknowledgement impossible to
+        correlate -- and the ack names no target, so correlation is the only
+        way to know which command it answers.
+        """
         return await self.send_request(
             _Request(
                 state_change_request(
-                    uuid, power, dim, source=self.client_name,
+                    uuid, power, dim,
+                    source=self.client_name,
+                    transaction_id=transaction_id,
                 ),
                 completed_callback=completed_callback,
             )
