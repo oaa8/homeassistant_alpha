@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from typing import Any, Callable
+from uuid import uuid4
 
 from ..models import ResponseType
 from ._manager import _Manager
@@ -102,6 +103,27 @@ MISSES_TO_UNREACHABLE = 2
 # confirm), and cancelled by anything that answers the question first.
 RETRY_DELAY_S = 30
 
+# DEVIATION (wayfinder #37/#39): how long a CONTROL has to be acknowledged
+# before we call it dropped.
+#
+# The hub answers a CONTROL in 27.9-86.4ms -- measured against real firmware
+# (3.21.9-prod-2025.232) on the spare node while resolving #39, and matching
+# the 50-290ms #37 worked from. Two seconds is therefore about seven times the
+# worst number anyone has seen.
+#
+# It has to stay comfortably *under* WITNESS_WINDOW_S, and that ordering is the
+# whole point rather than a detail. A command the hub never took must be
+# settled as a drop before the witness window would otherwise expire and count
+# it against the device, because those are two different faults:
+#
+#   no ack          -> the *hub* never took the command
+#   ack, no EVENT   -> the *switch* did not move (the #23 detector)
+#
+# Conflating them is what the house does today: a hub-dropped command opens a
+# witness window on a command the mesh never saw, and the device wears the
+# miss.
+ACK_WINDOW_S = 2
+
 
 class Deako:
     """Deako specific socket api."""
@@ -166,6 +188,27 @@ class Deako:
         # DEVIATION (wayfinder #26): the retries that bring a second miss
         # forward. See RETRY_DELAY_S.
         self.pending_retry: dict[str, asyncio.Task] = {}
+        # DEVIATION (wayfinder #37/#39): the CONTROL acknowledgement, which
+        # stock never read at all.
+        #
+        # `pending_acks` is the correlation table, keyed by the transaction id
+        # sent with each command, because the ack carries no target uuid -- an
+        # ack that cannot be correlated cannot be attributed to a device. It is
+        # also the drop detector: an entry that ages out without an ack is a
+        # command the hub never took.
+        #
+        # `optimistic` is the set of devices currently showing a commanded
+        # value rather than a witnessed one. Deliberately *not* in the device
+        # cache: the active probe reads get_state() and echoes it back at the
+        # mesh hourly, so optimism in the cache would be re-commanded forever,
+        # and a wrong optimistic dim would not merely display -- the probe
+        # would physically set the light to it.
+        self.optimistic_callbacks: dict[str, Callable[[dict | None], None]] = {}
+        self.optimistic: set[str] = set()
+        self.pending_acks: dict[str, dict] = {}
+        self.witness_transaction: dict[str, str] = {}
+        self.dropped_commands = 0
+        self.drop_listeners: list[Callable[[], None]] = []
 
     def add_connection_listener(
         self, listener: Callable[[bool], None],
@@ -193,6 +236,10 @@ class Deako:
             # could not have reached us whether or not the hub sent one. Void
             # those windows rather than let a hub outage mark every light
             # somebody happened to touch as unreachable.
+            #
+            # The outstanding commands go the same way and for the same reason
+            # (wayfinder #39): they are discarded, never counted as drops.
+            self.void_pending_acks()
             self.void_pending_witnesses()
         for listener in list(self.connection_listeners):
             try:
@@ -289,6 +336,98 @@ class Deako:
         """Return how many times the connection has been rebuilt."""
         return self.connection_manager.reconnect_count
 
+    def get_dropped_command_count(self) -> int:
+        """Return how many commands the hub never acknowledged.
+
+        DEVIATION (wayfinder #39). 0.3.1 held commands 500ms apart through a
+        send queue; 0.6.0 deleted the queue and spaces nothing, against a hub
+        that silently drops commands arriving under ~100ms apart. Nobody has
+        put those two facts together against real traffic, and this is the
+        instrument that will: it counts commands sent and never answered.
+
+        It counts the *hub* refusing to take a command, never a switch failing
+        to move -- that is the node status sensor's job, and keeping the two
+        apart is the point (see ACK_WINDOW_S).
+        """
+        return self.dropped_commands
+
+    def add_drop_listener(self, listener: Callable[[], None]) -> None:
+        """Register a listener for a command the hub never took."""
+        if listener not in self.drop_listeners:
+            self.drop_listeners.append(listener)
+
+    def remove_drop_listener(self, listener: Callable[[], None]) -> None:
+        """Unregister a dropped-command listener (wayfinder #39)."""
+        if listener in self.drop_listeners:
+            self.drop_listeners.remove(listener)
+
+    def notify_drop_listeners(self) -> None:
+        """Announce that the dropped-command count moved (wayfinder #39)."""
+        for listener in list(self.drop_listeners):
+            try:
+                listener()
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Dropped-command listener failed: %s", exc)
+
+    def set_optimistic_callback(
+        self, uuid: str, callback: Callable[[dict | None], None],
+    ) -> None:
+        """Register where a device's optimistic state should be shown.
+
+        DEVIATION (wayfinder #37/#39). Called with the commanded state when the
+        hub acknowledges a command, and with None when that optimism has to be
+        given up and the entity recomputed from the witnessed cache.
+
+        Separate from set_state_callback() on purpose, and that separation is
+        the decision #37 made: truth and display are kept in different places,
+        so what we merely asked for can never be mistaken for what the mesh
+        reported.
+        """
+        self.optimistic_callbacks[uuid] = callback
+
+    def apply_optimism(
+        self, uuid: str, power: bool, dim: int | None = None,
+    ) -> None:
+        """Show the commanded state now, before anything has confirmed it.
+
+        DEVIATION (wayfinder #37/#39). The ack is not the switch reporting
+        back: #13 proved a switch pulled out of the wall months earlier is
+        still acknowledged `status: "ok"`, and only its EVENT never comes. So
+        this is optimism, knowingly -- it says the hub took the command, and
+        the witness window is what holds it to account.
+        """
+        callback = self.optimistic_callbacks.get(uuid)
+        if callback is None:
+            return
+        state: dict[str, Any] = {"power": power}
+        # An omitted dim is a brightness nobody mentioned -- turn_off sends
+        # none -- and must leave whatever is displayed alone, not read as zero.
+        if dim is not None:
+            state["dim"] = dim
+        self.optimistic.add(uuid)
+        try:
+            callback(state)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.error("Optimistic callback failed for %s: %s", uuid, exc)
+
+    def clear_optimism(self, uuid: str) -> None:
+        """Give up on a commanded value and fall back to what was witnessed.
+
+        DEVIATION (wayfinder #37/#39). The flip back in the UI is the only
+        feedback anyone gets that the light did not answer, so it is a feature
+        rather than a cosmetic tidy-up.
+        """
+        if uuid not in self.optimistic:
+            return
+        self.optimistic.discard(uuid)
+        callback = self.optimistic_callbacks.get(uuid)
+        if callback is None:
+            return
+        try:
+            callback(None)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.error("Optimistic callback failed for %s: %s", uuid, exc)
+
     def update_state(
         self, uuid: str, power: bool, dim: int | None = None,
     ) -> None:
@@ -349,6 +488,12 @@ class Deako:
                 self.witness_device(subdata["target"])
                 self.update_state(
                     subdata["target"], state["power"], state.get("dim"),
+                )
+            elif in_data["type"] == ResponseType.CONTROL:
+                # DEVIATION (wayfinder #37/#39): the acknowledgement, which
+                # stock discarded because ResponseType had no member for it.
+                self.acknowledge_command(
+                    in_data.get("transactionId"), in_data.get("status"),
                 )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             _LOGGER.error("Failed to parse %s: %s", in_data, exc)
@@ -463,9 +608,180 @@ class Deako:
             self.sweep_timer.cancel()
             self.sweep_timer = None
 
+    def register_ack(
+        self, transaction_id: str, uuid: str, power: bool, dim: int | None,
+    ) -> None:
+        """Remember a command so its acknowledgement can be matched to it.
+
+        DEVIATION (wayfinder #37/#39). Registered *before* the bytes go out,
+        deliberately: the hub answers in tens of milliseconds and there must be
+        no window, however small, in which its ack could arrive against an
+        empty table and be discarded as uncorrelatable.
+
+        The timeout is armed separately, once the write has actually returned
+        (see arm_ack_window) -- a write that blocks is not a hub that ignored
+        us, and counting it as one would put a fault of ours into the number
+        the pacing question is waiting on.
+
+        Each command gets its own entry rather than one per device. Two
+        commands to the same light are two questions, and if the hub takes one
+        and drops the other, that is one drop -- collapsing them by uuid would
+        lose it.
+        """
+        self.pending_acks[transaction_id] = {
+            "uuid": uuid,
+            "power": power,
+            "dim": dim,
+            "task": None,
+        }
+
+    def arm_ack_window(self, transaction_id: str) -> None:
+        """Start the clock on a command that has actually left (#39).
+
+        Nothing to arm if the hub answered while the write was still in hand,
+        or if the command was discarded meanwhile.
+        """
+        entry = self.pending_acks.get(transaction_id)
+        if entry is None or entry["task"] is not None:
+            return
+        entry["task"] = asyncio.create_task(self.ack_window(transaction_id))
+
+    def discard_pending_ack(self, transaction_id: str) -> None:
+        """Drop a correlation entry without counting it (wayfinder #39)."""
+        entry = self.pending_acks.pop(transaction_id, None)
+        if entry is not None and entry["task"] is not None:
+            entry["task"].cancel()
+
+    def acknowledge_command(
+        self, transaction_id: str | None, status: str | None,
+    ) -> None:
+        """Handle the hub taking a command (DEVIATION, wayfinder #37/#39).
+
+        Correlation is strict, following the precedent #22 set for pongs: an
+        ack we cannot match answers nothing, and treating it as an answer to
+        whatever happens to be outstanding is the four-year-old bug found in
+        the Lua driver, where `reply.transactionId == reply.transactionId`
+        compared a value to itself. The echo is not assumed -- it was measured
+        on real firmware while resolving #39, 3/3 with no target uuid in the
+        reply.
+        """
+        entry = (
+            self.pending_acks.pop(transaction_id, None)
+            if transaction_id is not None
+            else None
+        )
+        if entry is None:
+            _LOGGER.debug(
+                "Ignoring an acknowledgement for %s; no command is waiting on "
+                "it", transaction_id,
+            )
+            return
+        if entry["task"] is not None:
+            entry["task"].cancel()
+
+        if status != "ok":
+            # Never observed. The hub answering something other than "ok" is
+            # not the same fault as it saying nothing, so it is not counted as
+            # a drop -- but it is not evidence about the switch either, so the
+            # witness window this command opened goes with it.
+            _LOGGER.warning(
+                "The hub refused the command to %s: status=%s",
+                entry["uuid"], status,
+            )
+            self.cancel_witness_for(transaction_id, entry["uuid"])
+            return
+
+        # Only ever shown while a witness window is open to take it back
+        # again. With no window nothing would ever revert it, and the entity
+        # would sit on a value nothing confirmed -- which is worse than the
+        # slow update this replaces. That happens when the switch's own EVENT
+        # beat the ack, in which case the truth is already on display and a
+        # guess must not be written over it.
+        if entry["uuid"] not in self.pending_witness:
+            _LOGGER.debug(
+                "Not showing the commanded state for %s: nothing is left "
+                "waiting to confirm or revert it", entry["uuid"],
+            )
+            return
+
+        self.apply_optimism(entry["uuid"], entry["power"], entry["dim"])
+
+    async def ack_window(self, transaction_id: str) -> None:
+        """Count a drop if the hub never answers (wayfinder #39).
+
+        The ack, and only the ack, decides this. An EVENT arriving in the
+        meantime is deliberately *not* accepted as evidence that the hub took
+        this particular command, and that is not an oversight -- it was
+        measured. Six commands fired at one device in a burst produce one ack
+        and five drops, but a single EVENT for that device; excusing a drop on
+        a witness would have written five of them off as one. The EVENT is
+        about the device, the ack is about the command, and only one of them
+        can answer the question this counter asks. (A wall switch somebody
+        happened to press would excuse a real drop the same way.)
+
+        The cost of that strictness is an ack arriving after the window --
+        possible in principle, never seen: the hub answers in 27.9-86.4ms
+        against a 2s window. If it ever starts happening, this number climbing
+        is itself worth knowing.
+        """
+        await asyncio.sleep(ACK_WINDOW_S)
+        entry = self.pending_acks.pop(transaction_id, None)
+        if entry is None:
+            return
+        uuid = entry["uuid"]
+
+        self.dropped_commands += 1
+        _LOGGER.warning(
+            "The hub did not acknowledge the command to %s within %ss; "
+            "treating it as dropped (%i so far)",
+            uuid, ACK_WINDOW_S, self.dropped_commands,
+        )
+        # This command never reached the mesh, so it says nothing about the
+        # device -- the same reasoning as void_pending_witnesses(). Without
+        # this the device would wear a miss for the hub's failure, and #26's
+        # retry would spend a real physical command confirming it.
+        self.cancel_witness_for(transaction_id, uuid)
+        self.notify_drop_listeners()
+
+    def void_pending_acks(self) -> None:
+        """Forget every outstanding command (DEVIATION, wayfinder #39).
+
+        Called when the connection goes away. A command in flight when the
+        socket died is not evidence about anything -- the ack could not have
+        reached us whether or not the hub sent one -- so these are discarded
+        rather than counted, exactly as void_pending_witnesses() discards the
+        windows it cannot answer.
+        """
+        for entry in self.pending_acks.values():
+            if entry["task"] is not None:
+                entry["task"].cancel()
+        self.pending_acks = {}
+
+    def cancel_witness_for(self, transaction_id: str | None, uuid: str) -> None:
+        """Close the witness window this command opened, if it still owns it.
+
+        DEVIATION (wayfinder #39). A newer command may have taken the window
+        over since, and that newer question is still live -- so the transaction
+        id is checked rather than the uuid alone.
+
+        The optimism goes with the window. It is the window that would have
+        taken it back, so leaving one without the other would strand a
+        commanded value on the entity with nothing left to revert it -- which
+        is exactly what happens when a light is commanded twice in quick
+        succession and the hub drops the second one.
+        """
+        if self.witness_transaction.get(uuid) != transaction_id:
+            return
+        self.witness_transaction.pop(uuid, None)
+        pending = self.pending_witness.pop(uuid, None)
+        if pending is not None:
+            pending.cancel()
+        self.clear_optimism(uuid)
+        self.cancel_retry(uuid)
+
     def watch_for_witness(
         self, uuid: str, power: bool | None = None, dim: int | None = None,
-        is_retry: bool = False,
+        is_retry: bool = False, transaction_id: str | None = None,
     ) -> None:
         """Start the window in which a command has to be witnessed.
 
@@ -480,11 +796,19 @@ class Deako:
         A superseding command cancels any retry the previous one had pending:
         that retry exists to confirm a miss, and a newer command asks the
         question again more directly.
+
+        The transaction id rides along too (wayfinder #39), so that a command
+        the hub turns out never to have taken can withdraw its own window
+        without disturbing a newer one.
         """
         existing = self.pending_witness.pop(uuid, None)
         if existing is not None:
             existing.cancel()
         self.cancel_retry(uuid)
+        if transaction_id is not None:
+            self.witness_transaction[uuid] = transaction_id
+        else:
+            self.witness_transaction.pop(uuid, None)
         self.pending_witness[uuid] = asyncio.create_task(
             self.witness_window(uuid, power, dim, is_retry)
         )
@@ -496,6 +820,12 @@ class Deako:
         """Count a miss if the commanded change is never witnessed."""
         await asyncio.sleep(WITNESS_WINDOW_S)
         self.pending_witness.pop(uuid, None)
+        self.witness_transaction.pop(uuid, None)
+        # DEVIATION (wayfinder #37/#39): the same expiry that counts a miss
+        # gives up the optimistic value. Nothing new is scheduled for it: a
+        # healthy light confirms at 2.4s worst case, so this only fires when
+        # the command genuinely was not carried out.
+        self.clear_optimism(uuid)
         misses = self.consecutive_misses.get(uuid, 0) + 1
         self.consecutive_misses[uuid] = misses
         _LOGGER.warning(
@@ -559,11 +889,8 @@ class Deako:
             "Re-sending the unwitnessed command to %s to confirm the miss",
             uuid,
         )
-        sent = await self.connection_manager.send_state_change(uuid, power, dim)
-        if not sent:
+        if not await self.send_command(uuid, power, dim, is_retry=True):
             _LOGGER.warning("Could not re-send the command to %s", uuid)
-            return
-        self.watch_for_witness(uuid, power, dim, is_retry=True)
 
     def cancel_retry(self, uuid: str) -> None:
         """Drop a pending retry for this device (wayfinder #26)."""
@@ -592,6 +919,10 @@ class Deako:
         pending = self.pending_witness.pop(uuid, None)
         if pending is not None:
             pending.cancel()
+        self.witness_transaction.pop(uuid, None)
+        # The truth has arrived and update_state() is about to write it, so
+        # there is no longer anything optimistic on display (wayfinder #39).
+        self.optimistic.discard(uuid)
         # A retry only exists to confirm a miss, and this is the answer it was
         # waiting for (wayfinder #26).
         self.cancel_retry(uuid)
@@ -616,6 +947,11 @@ class Deako:
         for task in self.pending_witness.values():
             task.cancel()
         self.pending_witness = {}
+        self.witness_transaction = {}
+        # Nothing is left to revert these, so they are given up now rather
+        # than left showing a commanded value forever (wayfinder #39).
+        for uuid in list(self.optimistic):
+            self.clear_optimism(uuid)
         for task in self.pending_retry.values():
             task.cancel()
         self.pending_retry = {}
@@ -629,6 +965,7 @@ class Deako:
         # DEVIATION (wayfinder #23): the diagnostics' own timers are ours to
         # clean up. Left running they would fire against a torn-down entry.
         self.cancel_sweep_timer()
+        self.void_pending_acks()
         self.void_pending_witnesses()
         self.connection_manager.close()
 
@@ -728,19 +1065,51 @@ class Deako:
         Stock awaited a send whose failure only ever reached a log line, so the
         light took the command, reported nothing wrong, and did not move.
         """
-        sent = await self.connection_manager.send_state_change(uuid, power, dim)
-        if not sent:
+        if not await self.send_command(uuid, power, dim):
             raise DeviceCommandError(
                 "no live connection to the hub"
                 if not self.is_connected()
                 else "the hub did not accept the command"
             )
 
+    async def send_command(
+        self, uuid: str, power: bool, dim: int | None = None,
+        is_retry: bool = False,
+    ) -> bool:
+        """Put one CONTROL on the wire and start watching for its answers.
+
+        DEVIATION (wayfinder #39). Two answers are now expected, and they are
+        different questions: the hub's acknowledgement, which says the command
+        was taken and drives the optimistic UI update, and the switch's EVENT,
+        which says the light actually moved (wayfinder #23).
+        """
+        transaction_id = str(uuid4())
+        # Registered before the send, armed after it: see register_ack.
+        self.register_ack(transaction_id, uuid, power, dim)
+        sent = await self.connection_manager.send_state_change(
+            uuid, power, dim, transaction_id=transaction_id,
+        )
+        if not sent:
+            # A command that never left the machine is not a dropped command,
+            # and it is not evidence about the device either.
+            self.discard_pending_ack(transaction_id)
+            return False
+
+        if not self.is_connected():
+            # The socket died while this was going out. Whether the bytes
+            # landed is unknowable, so nothing is counted and nothing is
+            # watched -- the same reasoning void_pending_witnesses() runs on,
+            # applied to the one command that was mid-flight when it ran.
+            self.discard_pending_ack(transaction_id)
+            return False
+
+        self.arm_ack_window(transaction_id)
         # DEVIATION (wayfinder #23): the command that just left is the probe.
         # Started only once the bytes are away, so a send that never happened
         # is not counted against the device. The command travels with the
         # window (wayfinder #26) so a first miss can be re-asked.
-        self.watch_for_witness(uuid, power, dim)
+        self.watch_for_witness(uuid, power, dim, is_retry, transaction_id)
+        return True
 
     def get_name(self, uuid: str) -> str | None:
         """Get a device's name by uuid."""

@@ -83,7 +83,17 @@ def summarize() -> int:
 
 
 class _StubManager:
-    """Stands in for _Manager so Deako can be driven without a socket."""
+    """Stands in for _Manager so Deako can be driven without a socket.
+
+    It acknowledges by default, because real firmware does: every CONTROL sent
+    to the spare node was answered `status: "ok"` with the transactionId echoed
+    back, in 27.9-86.4ms (wayfinder #39). A stub that stayed silent would put
+    the #23 and #26 checks below into the *dropped-command* path rather than
+    the unwitnessed-device path, and they would then be proving something other
+    than what they say they prove.
+
+    ``ack_sends = False`` is how the drop path is exercised deliberately.
+    """
 
     def __init__(self, send_ok: bool = True) -> None:
         self.device_list_requests = 0
@@ -92,15 +102,33 @@ class _StubManager:
         self.connected = False
         self.reconnect_count = 0
         self.last_message_age: float | None = None
+        self.ack_sends = True
+        self.ack_status = "ok"
+        self.transaction_ids: list[str] = []
+        self.deako: Deako | None = None
 
     async def send_get_device_list(self) -> bool:
         self.device_list_requests += 1
         return self.send_ok
 
     async def send_state_change(
-        self, uuid, power, dim=None, completed_callback=None,
+        self, uuid, power, dim=None, transaction_id=None,
+        completed_callback=None,
     ) -> bool:
         self.state_changes += 1
+        self.transaction_ids.append(transaction_id)
+        if self.send_ok and self.ack_sends and self.deako is not None:
+            # Delivered on the next loop pass rather than inline, which is what
+            # a hub tens of milliseconds away does. Inline would arrive before
+            # the caller had even finished sending.
+            asyncio.get_running_loop().call_soon(
+                self.deako.incoming_json,
+                {
+                    "type": "CONTROL",
+                    "transactionId": transaction_id,
+                    "status": self.ack_status,
+                },
+            )
         return self.send_ok
 
     def seconds_since_last_message(self) -> float | None:
@@ -113,6 +141,7 @@ class _StubManager:
 def _stub_deako(send_ok: bool = True) -> tuple[Deako, _StubManager]:
     deako = Deako(lambda: None)
     manager = _StubManager(send_ok=send_ok)
+    manager.deako = deako
     deako.connection_manager = manager  # type: ignore[assignment]
     return deako, manager
 
@@ -386,6 +415,270 @@ async def offline_checks() -> None:
         )
     finally:
         deako_module.WITNESS_WINDOW_S = original_window
+
+    # -- wayfinder #37/#39: the acknowledgement, optimism, and the drops -----
+    #
+    # Production is ACK_WINDOW_S = 2 inside WITNESS_WINDOW_S = 5, and that
+    # ordering is load-bearing: a command the hub never took has to be settled
+    # as a drop *before* the witness window would blame the device for it. The
+    # two constants are therefore always shortened together and in proportion,
+    # never one of them -- a suite that inverted them would be checking a
+    # sequence that cannot happen in the house.
+    original_ack = deako_module.ACK_WINDOW_S
+    original_witness = deako_module.WITNESS_WINDOW_S
+    try:
+        deako_module.WITNESS_WINDOW_S = 0.5
+        deako_module.ACK_WINDOW_S = 0.05
+
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        shown: list[dict | None] = []
+        deako.set_optimistic_callback(DIMMABLE_UUID, shown.append)
+
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        await asyncio.sleep(0.1)
+        cached = deako.get_state(DIMMABLE_UUID)
+        check(
+            "#39 the acknowledgement shows the commanded state at once",
+            shown == [{"power": True, "dim": 40}],
+            f"shown={shown} -- the ack lands in tens of milliseconds, against "
+            "the 1549-3412ms the confirming EVENT took in the house",
+        )
+        check(
+            "#39 optimism does not reach the device cache",
+            cached == {"power": False, "dim": 80},
+            f"cache={cached} -- the hourly probe reads this cache and echoes "
+            "it back at the mesh, so an optimistic value here would be "
+            "re-commanded forever and a wrong dim would physically set the "
+            "light",
+        )
+
+        # The revert is the only feedback anyone gets that the light did not
+        # answer, and it recomputes from the cache rather than guessing.
+        await asyncio.sleep(0.6)
+        check(
+            "#39 the witness window closing gives the optimism up again",
+            shown == [{"power": True, "dim": 40}, None],
+            f"shown={shown}",
+        )
+
+        # A light that answers keeps what it was shown, and the EVENT writes
+        # the truth over it through the ordinary state callback.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        shown = []
+        deako.set_optimistic_callback(DIMMABLE_UUID, shown.append)
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        await asyncio.sleep(0.1)
+        deako.incoming_json({
+            "type": "EVENT",
+            "data": {"target": DIMMABLE_UUID, "state": {"power": True, "dim": 40}},
+        })
+        await asyncio.sleep(0.6)
+        check(
+            "#39 a witnessed command is never reverted",
+            shown == [{"power": True, "dim": 40}]
+            and deako.optimistic == set(),
+            f"shown={shown} -- a revert here would flip a light that worked",
+        )
+
+        # Correlation is strict, following #22's precedent for pongs: the ack
+        # names no target, so an ack we cannot match cannot be attributed to
+        # any device at all.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        manager.ack_sends = False
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        shown = []
+        deako.set_optimistic_callback(DIMMABLE_UUID, shown.append)
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        deako.incoming_json({
+            "type": "CONTROL",
+            "transactionId": "an-id-we-never-sent",
+            "status": "ok",
+        })
+        check(
+            "#39 an acknowledgement we cannot correlate moves nothing",
+            shown == [],
+            f"shown={shown} -- the Lua driver's filter compared a value to "
+            "itself, so any ack satisfied any outstanding command",
+        )
+
+        # ... and the same silence is what a dropped command looks like.
+        await asyncio.sleep(0.2)
+        dropped_after_ack_window = deako.get_dropped_command_count()
+        await asyncio.sleep(0.6)
+        check(
+            "#39 a command the hub never acknowledges is counted as dropped",
+            dropped_after_ack_window == 1,
+            f"dropped={dropped_after_ack_window} -- 0.6.0 deleted 0.3.1's "
+            "send queue and spaces nothing, against a hub that silently drops "
+            "commands under ~100ms apart",
+        )
+        check(
+            "#39 a dropped command is not counted against the device",
+            deako.consecutive_misses == {}
+            and deako.pending_witness == {}
+            and deako.pending_retry == {}
+            and deako.is_reachable(DIMMABLE_UUID),
+            f"misses={deako.consecutive_misses} -- no ack means the *hub* "
+            "never took it; blaming the switch is what the integration did "
+            "before, and #26's retry then spent a real physical command "
+            "confirming a fault that was never there",
+        )
+
+        # The ack answers for one command; an EVENT answers for the device.
+        # Only one of them can settle whether *this* command was taken, and
+        # letting a witness excuse a drop was measured undercounting a burst of
+        # six commands as one (wayfinder #39).
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        manager.ack_sends = False
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        await deako.control_device(DIMMABLE_UUID, True, 60)
+        deako.incoming_json({
+            "type": "EVENT",
+            "data": {"target": DIMMABLE_UUID, "state": {"power": True, "dim": 40}},
+        })
+        await asyncio.sleep(0.2)
+        check(
+            "#39 an EVENT does not excuse the commands the hub never answered",
+            deako.get_dropped_command_count() == 2,
+            f"dropped={deako.get_dropped_command_count()} of 2 sent -- one "
+            "witness cannot speak for several commands, and a wall switch "
+            "somebody pressed would excuse a real drop the same way",
+        )
+
+        # A command in flight when the socket died is not evidence about
+        # anything -- the same reasoning void_pending_witnesses() runs on.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        manager.ack_sends = False
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        manager.connected = False
+        deako.notify_connection_listeners(False)
+        await asyncio.sleep(0.2)
+        check(
+            "#39 losing the connection discards outstanding commands rather "
+            "than counting them",
+            deako.get_dropped_command_count() == 0
+            and deako.pending_acks == {},
+            f"dropped={deako.get_dropped_command_count()}, "
+            f"pending={deako.pending_acks}",
+        )
+
+        # A send that never left the machine is not the hub's fault either.
+        deako, manager = _stub_deako(send_ok=False)
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        try:
+            await deako.control_device(DIMMABLE_UUID, True, 40)
+        except DeviceCommandError:
+            pass
+        await asyncio.sleep(0.2)
+        check(
+            "#39 a command that failed to send is not counted as dropped",
+            deako.get_dropped_command_count() == 0
+            and deako.pending_acks == {},
+            f"dropped={deako.get_dropped_command_count()}",
+        )
+
+        # Two commands in quick succession, the second dropped. The window the
+        # first opened has already been replaced, and cancelling the second
+        # one's must not leave the first one's optimism on the entity with
+        # nothing left to take it back.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        shown = []
+        deako.set_optimistic_callback(DIMMABLE_UUID, shown.append)
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        await asyncio.sleep(0.01)
+        manager.ack_sends = False
+        await deako.control_device(DIMMABLE_UUID, True, 60)
+        await asyncio.sleep(0.2)
+        check(
+            "#39 a dropped second command does not strand the first one's "
+            "optimism",
+            shown == [{"power": True, "dim": 40}, None]
+            and deako.optimistic == set(),
+            f"shown={shown} -- the window is what would have reverted it, so "
+            "cancelling the window has to give the optimism up as well, or the "
+            "light sits on a value nothing confirmed",
+        )
+
+        # An EVENT that beats the ack has already put the truth on display.
+        # Writing a guess over it afterwards would leave it there for good,
+        # because the window it would have been reverted by is gone.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        manager.ack_sends = False
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        shown = []
+        deako.set_optimistic_callback(DIMMABLE_UUID, shown.append)
+        await deako.control_device(DIMMABLE_UUID, True, 40)
+        deako.incoming_json({
+            "type": "EVENT",
+            "data": {"target": DIMMABLE_UUID, "state": {"power": True, "dim": 90}},
+        })
+        deako.incoming_json({
+            "type": "CONTROL",
+            "transactionId": manager.transaction_ids[-1],
+            "status": "ok",
+        })
+        await asyncio.sleep(0.1)
+        check(
+            "#39 an ack arriving after the switch answered shows nothing",
+            shown == [] and deako.optimistic == set(),
+            f"shown={shown} -- the mesh has already spoken for this device, "
+            "and there is no window left to take a guess back",
+        )
+
+        # A socket that died while the bytes were going out: the command is
+        # neither counted nor watched, and the caller is told, because a
+        # command issued into a dead connection has to fail visibly (O5).
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = False
+        manager.ack_sends = False
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, False, 80)
+        raised = None
+        try:
+            await deako.control_device(DIMMABLE_UUID, True, 40)
+        except DeviceCommandError as exc:
+            raised = exc
+        await asyncio.sleep(0.2)
+        check(
+            "#39 a send that completed into a dead socket is neither counted "
+            "nor watched",
+            raised is not None
+            and deako.get_dropped_command_count() == 0
+            and deako.pending_acks == {}
+            and deako.pending_witness == {},
+            f"raised={raised!r}, dropped={deako.get_dropped_command_count()}, "
+            f"pending_witness={deako.pending_witness}",
+        )
+
+        # turn_off sends no dim, and a brightness nobody asked for must not
+        # appear on the way past.
+        deako, manager = _stub_deako(send_ok=True)
+        manager.connected = True
+        deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+        shown = []
+        deako.set_optimistic_callback(DIMMABLE_UUID, shown.append)
+        await deako.control_device(DIMMABLE_UUID, False)
+        await asyncio.sleep(0.1)
+        check(
+            "#39 a command with no dim carries no brightness into the UI",
+            shown == [{"power": False}],
+            f"shown={shown} -- an omitted dim is 'nobody mentioned "
+            "brightness', not 'brightness zero'",
+        )
+    finally:
+        deako_module.ACK_WINDOW_S = original_ack
+        deako_module.WITNESS_WINDOW_S = original_witness
 
     # -- wayfinder #23: per-sweep enumeration accounting ---------------------
     #

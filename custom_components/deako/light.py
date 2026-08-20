@@ -15,6 +15,12 @@ hub that vanished a day ago looks exactly like a healthy one. Here:
     shows as unavailable rather than deleting -- and a late DEVICE_FOUND
     creates one, which is the part that was missing;
   * a command sent while disconnected raises instead of being swallowed.
+
+And, from wayfinder #37/#39, the entity is where optimism lives: the hub's
+acknowledgement of a command writes the commanded value here and nowhere else,
+so the UI answers in tens of milliseconds instead of waiting 1.5-3.4s for the
+switch's own EVENT. See on_optimistic for why the device cache must not learn
+about it.
 """
 import logging
 from typing import Any
@@ -125,6 +131,11 @@ class DeakoLightEntity(LightEntity):
         )
 
         client.set_state_callback(uuid, self.on_update)
+        # wayfinder #37/#39: separate from the state callback above, and that
+        # separation is the decision. The cache holds what the mesh witnessed;
+        # this holds what we asked for, and it lives no further than this
+        # entity -- see on_optimistic.
+        client.set_optimistic_callback(uuid, self.on_optimistic)
         self.update()  # set initial state
 
     async def async_added_to_hass(self) -> None:
@@ -171,6 +182,45 @@ class DeakoLightEntity(LightEntity):
         self.update()
         # A DEVICE_FOUND can land between constructing this entity and Home
         # Assistant adopting it, and writing state before then raises.
+        if self.hass is not None:
+            self.schedule_update_ha_state()
+
+    @callback
+    def on_optimistic(self, state: dict | None) -> None:
+        """Show what was commanded, or give it up again (wayfinder #37/#39).
+
+        Called with the commanded state when the hub acknowledges a command --
+        27.9-86.4ms on real firmware, against the 1549-3412ms the confirming
+        EVENT took in the house -- and with None when the witness window closes
+        with nothing having confirmed it.
+
+        This writes `_attr_` fields and nothing else. It must never reach the
+        device cache: the active reachability probe reads that cache and echoes
+        it back at the mesh hourly, so a wrong optimistic value there would be
+        re-commanded forever, and a wrong optimistic `dim` would physically set
+        the light rather than merely display it.
+
+        Giving up is a revert to the witnessed value, which is still sitting in
+        the cache untouched -- and that flip back in the UI is the only
+        feedback anybody gets that the light did not answer.
+        """
+        if state is None:
+            _LOGGER.debug(
+                "Nothing confirmed the command to %s; showing the last "
+                "witnessed state again", self.entity_id,
+            )
+            self.update()
+        else:
+            self._attr_is_on = bool(state.get("power", False))
+            if (
+                state.get("dim") is not None
+                and self._attr_supported_color_modes is not None
+                and ColorMode.BRIGHTNESS in self._attr_supported_color_modes
+            ):
+                # No dim was sent means no brightness was asked for -- turn_off
+                # sends none, and neither does a plain turn_on -- so whatever
+                # is displayed stays.
+                self._attr_brightness = round(state["dim"] * 2.55)
         if self.hass is not None:
             self.schedule_update_ha_state()
 

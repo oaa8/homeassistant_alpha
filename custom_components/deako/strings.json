@@ -53,6 +53,9 @@
       "reconnects": {
         "name": "Reconnects since restart"
       },
+      "dropped_commands": {
+        "name": "Unacknowledged commands"
+      },
       "last_message_age": {
         "name": "Time since last hub message"
       },

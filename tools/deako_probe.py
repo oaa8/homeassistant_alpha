@@ -25,6 +25,7 @@ Usage
     python tools/deako_probe.py --host <addr> listen --seconds 300
     python tools/deako_probe.py --host <addr> newlines --count 60 --interval 10
     python tools/deako_probe.py --host <addr> control --target <uuid> --power on
+    python tools/deako_probe.py --host <addr> ack --devices 3
 """
 
 from __future__ import annotations
@@ -297,6 +298,126 @@ async def cmd_control(conn_factory: Callable[[], DeakoConnection], args) -> int:
     return 0
 
 
+async def cmd_ack(conn_factory: Callable[[], DeakoConnection], args) -> int:
+    """Answer whether the hub echoes a CONTROL's transactionId back, and how fast.
+
+    Wayfinder #37 chose the CONTROL acknowledgement as the trigger for the
+    optimistic UI update, and correlation by transactionId is not optional
+    there: the ack carries no target uuid, so an uncorrelatable ack cannot be
+    matched to the command it answers. The echo was captured against the
+    *simulator* and only inferred for real firmware, which is an inference the
+    whole design rests on -- so it gets measured here before anything is built
+    on it.
+
+    Each device is commanded with the state it already reports, so nothing in
+    the room moves. Commands are spaced above the hub's documented silent-drop
+    threshold, because a dropped command and a hub that does not echo look
+    identical from here and this run must not confuse the two.
+    """
+    async with conn_factory() as conn:
+        expected: int | None = None
+        devices: dict[str, dict[str, Any]] = {}
+
+        def collect(parsed, _raw, _offset) -> bool:
+            nonlocal expected
+            if not parsed:
+                return False
+            if parsed.get("type") == "DEVICE_LIST" and "data" in parsed:
+                expected = parsed["data"].get("number_of_devices")
+            elif parsed.get("type") == "DEVICE_FOUND":
+                data = parsed.get("data", {})
+                if data.get("uuid"):
+                    devices[data["uuid"]] = data
+            return expected is not None and len(devices) >= expected
+
+        conn.capture.note("enumerating to learn each device's own state")
+        await conn.send({"type": "DEVICE_LIST"})
+        await conn.read_lines(args.enumerate_timeout, on_message=collect)
+        conn.capture.note(f"enumerated {len(devices)} of {expected} devices")
+        if not devices:
+            conn.capture.note("no devices to command; nothing to measure")
+            return 2
+
+        targets = list(devices)[: args.devices]
+        results: list[dict[str, Any]] = []
+
+        for index, uuid_ in enumerate(targets, 1):
+            data = devices[uuid_]
+            reported = data.get("state", {})
+            power = bool(reported.get("power"))
+            # Idempotent: the device's own reported state, sent back to it.
+            # dim only alongside power:true, exactly as the integration's probe
+            # does -- a dim on an off command is a brightness nobody asked for.
+            state: dict[str, Any] = {"power": power}
+            if power and reported.get("dim") is not None:
+                state["dim"] = reported["dim"]
+
+            conn.capture.note(
+                f"--- command {index}/{len(targets)}: {data.get('name', uuid_)}"
+                f" <- {json.dumps(state)} (its own reported state)"
+            )
+            sent_at = time.monotonic()
+            txn = await conn.send(
+                {"type": "CONTROL", "data": {"target": uuid_, "state": state}}
+            )
+
+            ack: dict[str, Any] | None = None
+            ack_ms: float | None = None
+
+            def check(parsed, _raw, _offset) -> bool:
+                nonlocal ack, ack_ms
+                if parsed and parsed.get("type") == "CONTROL":
+                    ack = parsed
+                    ack_ms = (time.monotonic() - sent_at) * 1000.0
+                    return True
+                return False
+
+            await conn.read_lines(args.wait, on_message=check)
+
+            result = {
+                "target": uuid_,
+                "sent_transaction_id": txn,
+                "acked": ack is not None,
+                "ack_transaction_id": (ack or {}).get("transactionId"),
+                "echoed": bool(ack) and ack.get("transactionId") == txn,
+                "status": (ack or {}).get("status"),
+                "ack_ms": round(ack_ms, 1) if ack_ms is not None else None,
+                "ack_names_a_target": bool(ack) and "data" in ack,
+            }
+            results.append(result)
+            conn.capture.note(f"result: {json.dumps(result)}")
+
+            if index < len(targets):
+                await asyncio.sleep(args.spacing)
+
+    print("\n=== CONTROL acknowledgement summary ===", flush=True)
+    for result in results:
+        print(json.dumps(result), flush=True)
+
+    acked = [r for r in results if r["acked"]]
+    echoed = [r for r in acked if r["echoed"]]
+    latencies = [r["ack_ms"] for r in acked if r["ack_ms"] is not None]
+    print(
+        f"\ncommands sent: {len(results)}; acknowledged: {len(acked)}; "
+        f"transactionId echoed: {len(echoed)}",
+        flush=True,
+    )
+    if latencies:
+        print(
+            f"ack latency: {min(latencies):.1f}-{max(latencies):.1f} ms",
+            flush=True,
+        )
+    if any(r["ack_names_a_target"] for r in acked):
+        print(
+            "NOTE: an ack carried a `data` block -- re-read it, because #37 "
+            "rests on the ack naming no target.",
+            flush=True,
+        )
+    # Correlation is only possible if every ack echoed. A partial result is a
+    # failure, not a qualified success.
+    return 0 if acked and len(echoed) == len(results) else 1
+
+
 async def cmd_raw(conn_factory: Callable[[], DeakoConnection], args) -> int:
     """Send arbitrary JSON messages on one connection, capturing each reply.
 
@@ -392,6 +513,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctl.add_argument("--dim", type=float)
     p_ctl.add_argument("--wait", type=float, default=10.0)
     p_ctl.set_defaults(func=cmd_control)
+
+    p_ack = sub.add_parser(
+        "ack", help="does the hub echo a CONTROL's transactionId, and how fast?"
+    )
+    p_ack.add_argument(
+        "--devices", type=int, default=3, help="how many devices to command"
+    )
+    p_ack.add_argument("--wait", type=float, default=10.0)
+    p_ack.add_argument("--spacing", type=float, default=1.1)
+    p_ack.add_argument("--enumerate-timeout", type=float, default=30.0)
+    p_ack.set_defaults(func=cmd_ack)
 
     p_raw = sub.add_parser("raw", help="send arbitrary JSON probes on one connection")
     p_raw.add_argument(
