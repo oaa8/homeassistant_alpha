@@ -238,11 +238,23 @@ class DeakoHubDiagnosticSensor(SensorEntity):
 class DeakoHubReconnects(DeakoHubDiagnosticSensor):
     """How many times the connection has been rebuilt since startup.
 
-    Read alongside the connectivity sensor, never on its own. 0.6.0 has no
-    reconnect backoff -- a dead node is retried about six times a minute, and
-    #19 measured that against real firmware -- so this counts connections that
-    came *back*. A single long outage therefore adds one, and what this number
-    really measures is how often the hub went away, not how long for.
+    Read alongside the connectivity sensor, never on its own. This counts
+    connections that came *back*, so a single long outage adds one, and what
+    this number really measures is how often the hub went away, not how long
+    for.
+
+    Wayfinder #41 changed what counts as coming back, and the change is not
+    cosmetic: a connection is only counted once the hub has answered a ping on
+    it. Before that, a TCP handshake was enough -- and Deako's telnet server is
+    exclusive, so a *stuck* slot accepted our socket and served nothing across
+    it. #32's ten reconnects therefore were not ten node failures; some of them
+    were this integration knocking on a door that had not finished closing and
+    logging each knock as an arrival. **Recorder history is not comparable
+    across the release that shipped #41.**
+
+    The attempts that do not get there are on the attributes rather than in the
+    state, because they answer a different question -- what the reconnect was
+    doing -- and #32 closed with no instrument for it at all.
     """
 
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
@@ -256,17 +268,39 @@ class DeakoHubReconnects(DeakoHubDiagnosticSensor):
         """Return the count since this entry was set up."""
         return self.client.get_reconnect_count()
 
+    @property
+    def extra_state_attributes(self) -> dict[str, int]:
+        """Report what the attempts did, not just the ones that arrived.
+
+        Wayfinder #41. `unanswered_attempts` is a subset of `failed_attempts`
+        and is the one to read first: it is the stuck exclusive slot -- socket
+        open, hub silent -- rather than a node that is simply away.
+        """
+        return {
+            "failed_attempts": self.client.get_failed_attempt_count(),
+            "unanswered_attempts": self.client.get_unanswered_attempt_count(),
+        }
+
     async def async_added_to_hass(self) -> None:
         """A reconnect is a connection change, so this is the same signal."""
         self.client.add_connection_listener(self.on_connection_change)
+        # A failed attempt changes nothing anyone can see, so it has its own
+        # signal or the attributes would only refresh when something else moved.
+        self.client.add_attempt_listener(self.on_attempt)
 
     async def async_will_remove_from_hass(self) -> None:
         """Stop listening."""
         self.client.remove_connection_listener(self.on_connection_change)
+        self.client.remove_attempt_listener(self.on_attempt)
 
     @callback
     def on_connection_change(self, connected: bool) -> None:
         """Write the new count out."""
+        self.schedule_update_ha_state()
+
+    @callback
+    def on_attempt(self) -> None:
+        """Write the new attempt attributes out."""
         self.schedule_update_ha_state()
 
 

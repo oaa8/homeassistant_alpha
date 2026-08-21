@@ -93,6 +93,8 @@ def create_http_app(state: SimulatorState, config: Config, quirk_manager: QuirkM
         # T071: Connection resilience control endpoints
         web.post('/api/control/disconnect', disconnect_active_connection),
         web.post('/api/control/refuse-connections', set_refuse_connections),
+        # wayfinder #41: the stuck exclusive slot -- accepted, then silent
+        web.post('/api/control/mute', set_mute_connections),
         web.post('/api/control/latency', set_connection_latency),
         # wayfinder #16 (O10): enumeration shortfall and late arrival
         web.post('/api/control/withhold', set_withheld_devices),
@@ -101,7 +103,7 @@ def create_http_app(state: SimulatorState, config: Config, quirk_manager: QuirkM
         web.post('/api/control/unreachable', set_unreachable_devices),
     ])
     
-    logger.info("HTTP API application created with 12 routes")
+    logger.info("HTTP API application created with 13 routes")
     return app
 
 
@@ -661,6 +663,66 @@ async def set_refuse_connections(request: Request) -> Response:
             "refuse_connections": refuse
         })
         
+    except (ValueError, KeyError) as e:
+        return web.json_response(
+            {"error": f"Invalid request: {e}"},
+            status=400
+        )
+
+
+async def set_mute_connections(request: Request) -> Response:
+    """
+    POST /api/control/mute - Accept connections and then serve nothing (#41).
+
+    Purpose: reproduce the *stuck exclusive slot*. This is modelled hub
+    behaviour, not invented fault injection: Deako's telnet server is exclusive,
+    and on an ESP32 the network stack completes the handshake a layer below the
+    telnet application, so a node still holding a previous session accepts the
+    TCP connection and serves nothing across it. Wayfinder #32 caught the house
+    node doing exactly that -- accepted, silent for 13s, then closed by the node.
+
+    It is a different fault from refuse-connections, and the difference is the
+    reason #41 exists. A refusal is honest. This one looks healthy to anything
+    that asks only whether the socket opened, which is what `is_connected()` did
+    before #41 -- so 37 lights read available while nothing was being served.
+
+    Request: {"mute": true/false, "close_after": <seconds, optional>}
+    Response: {"status": "ok", "mute_connections": bool, "close_after": float}
+
+    close_after 0 (default) holds the socket open indefinitely, which is the
+    harder case: nothing ever tells the client its connection is useless.
+    """
+    quirk_manager = request.app[QUIRK_KEY]
+
+    try:
+        data = await request.json()
+        mute = data.get("mute", False)
+        close_after = data.get("close_after", 0)
+
+        if not isinstance(mute, bool):
+            return web.json_response(
+                {"error": "mute must be boolean"},
+                status=400
+            )
+        if not isinstance(close_after, (int, float)) or close_after < 0:
+            return web.json_response(
+                {"error": "close_after must be a non-negative number"},
+                status=400
+            )
+
+        quirk_manager.set_mute(mute, float(close_after))
+
+        logger.info(
+            f"[http] Control operation: mute_connections={mute} "
+            f"close_after={close_after}"
+        )
+
+        return web.json_response({
+            "status": "ok",
+            "mute_connections": mute,
+            "close_after": float(close_after),
+        })
+
     except (ValueError, KeyError) as e:
         return web.json_response(
             {"error": f"Invalid request: {e}"},

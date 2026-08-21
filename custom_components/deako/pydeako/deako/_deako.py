@@ -145,11 +145,19 @@ class Deako:
             # unavailable the moment the hub goes away, instead of serving
             # cached state that stopped being true.
             on_connection_change=self.notify_connection_listeners,
+            # DEVIATION (wayfinder #41): a failed attempt is not a connection
+            # change -- down stays down -- so the attempt counters would sit
+            # stale on the sensor until something else moved. This is the poke.
+            on_connection_attempt=self.notify_attempt_listeners,
         )
         self.devices: dict[str, Any] = {}
         self.expected_devices = 0
         # DEVIATION (O5): listeners for connection up/down.
         self.connection_listeners: list[Callable[[bool], None]] = []
+        # DEVIATION (wayfinder #41): listeners for a connection attempt that
+        # failed. Separate from the above because a failed attempt changes no
+        # state anyone can see -- it only moves a counter.
+        self.attempt_listeners: list[Callable[[], None]] = []
         # DEVIATION (O10): fired when a device reports for the first time. A
         # device that was silent during enumeration has no entity at all, so
         # there is no per-device callback to reach -- this is how a late
@@ -333,8 +341,51 @@ class Deako:
         return self.connection_manager.seconds_since_last_message()
 
     def get_reconnect_count(self) -> int:
-        """Return how many times the connection has been rebuilt."""
+        """Return how many times the connection has been rebuilt.
+
+        DEVIATION (wayfinder #41): this counts connections the hub has
+        *answered on*. Before #41 it counted arrivals at a socket, which is why
+        #32's ten reconnects were not ten node failures. The meaning changes at
+        that release and recorder history is not comparable across it.
+        """
         return self.connection_manager.reconnect_count
+
+    def get_failed_attempt_count(self) -> int:
+        """Return how many connection attempts did not produce a connection.
+
+        DEVIATION (wayfinder #41): #32 closed with the loose end that there was
+        no instrument that would explain the next burst. This is it, and it is
+        the number the reconnect count deliberately no longer contains.
+        """
+        return self.connection_manager.failed_connection_attempts
+
+    def get_unanswered_attempt_count(self) -> int:
+        """Return how many attempts opened a socket the hub never answered on.
+
+        DEVIATION (wayfinder #41): the stuck-slot shape specifically -- TCP up,
+        nothing served across it. A subset of the failed attempts, and the one
+        worth telling apart, because it is us knocking on a door that has not
+        finished closing rather than a node that is away.
+        """
+        return self.connection_manager.unanswered_connection_attempts
+
+    def add_attempt_listener(self, listener: Callable[[], None]) -> None:
+        """Register a listener for a failed connection attempt (#41)."""
+        if listener not in self.attempt_listeners:
+            self.attempt_listeners.append(listener)
+
+    def remove_attempt_listener(self, listener: Callable[[], None]) -> None:
+        """Unregister a failed-attempt listener (wayfinder #41)."""
+        if listener in self.attempt_listeners:
+            self.attempt_listeners.remove(listener)
+
+    def notify_attempt_listeners(self) -> None:
+        """Announce that a connection attempt failed (wayfinder #41)."""
+        for listener in list(self.attempt_listeners):
+            try:
+                listener()
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Connection attempt listener failed: %s", exc)
 
     def get_dropped_command_count(self) -> int:
         """Return how many commands the hub never acknowledged.

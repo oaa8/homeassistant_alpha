@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -46,7 +47,7 @@ import pydeako  # noqa: E402
 from pydeako.deako import _deako as deako_module  # noqa: E402
 from pydeako.deako import Deako, DeviceCommandError, FindDevicesError  # noqa: E402
 from pydeako.deako._manager import _Manager, PING_WORKER_WAIT_S  # noqa: E402
-from pydeako.models import ResponseType, device_ping_request  # noqa: E402
+from pydeako.models import ResponseType, RequestType, device_ping_request  # noqa: E402
 
 VENDORED_ROOT = REPO_ROOT / "custom_components" / "deako" / "pydeako"
 if Path(pydeako.__file__).resolve().parent != VENDORED_ROOT.resolve():
@@ -101,6 +102,8 @@ class _StubManager:
         self.send_ok = send_ok
         self.connected = False
         self.reconnect_count = 0
+        self.failed_connection_attempts = 0
+        self.unanswered_connection_attempts = 0
         self.last_message_age: float | None = None
         self.ack_sends = True
         self.ack_status = "ok"
@@ -799,18 +802,39 @@ async def offline_checks() -> None:
     from pydeako.deako import _manager as manager_module
 
     class _InstantConnection:
-        """A _Connection that is connected the moment it is built."""
+        """A _Connection that is connected the moment it is built.
 
-        def __init__(self, address, name, _callback, on_state_change=None) -> None:
+        Wayfinder #41 added a second requirement to that: the hub has to answer
+        a ping before the manager will call it a connection. So this stub
+        answers -- echoing the transaction id, which is not an assumption but
+        captured behaviour from the spare node (#19, and the O4 correlation
+        rests on the same capture).
+        """
+
+        def __init__(self, address, name, callback, on_state_change=None) -> None:
             self.address = address
             self.name = name
             self.on_state_change = on_state_change
+            self.on_data_callback = callback
+            self.state = manager_module.ConnectionState.CONNECTED
             # _Manager.is_connected() reaches through to the raw socket, since
             # _Connection.close() does not move the state machine out of
             # CONNECTED (DEVIATION O5).
             self.socket = type("_Sock", (), {"sock": object()})()
 
         def is_connected(self) -> bool:
+            return True
+
+        def format_name(self) -> str:
+            return f"{self.name}@{self.address}"
+
+        async def send_data(self, data_to_send: str) -> bool:
+            message = json.loads(data_to_send)
+            if message.get("type") == RequestType.PING:
+                self.on_data_callback({
+                    "type": ResponseType.PONG,
+                    "transactionId": message.get("transactionId"),
+                })
             return True
 
         def close(self) -> None:
@@ -1328,6 +1352,88 @@ async def live_checks(port: int, http_port: int) -> None:
             (reporting, expected, missing) == (2, 2, []),
             f"reporting={reporting}, expected={expected}, missing={missing} "
             "(O7's resync re-enumerates, so the sweep numbers refresh with it)",
+        )
+
+        # -- #41 over the wire: the stuck exclusive slot. The simulator accepts
+        #    the socket and serves nothing across it, which is what a node still
+        #    holding a previous telnet session does -- #32 caught the house node
+        #    doing exactly this for 13s, and the map owner confirmed the
+        #    mechanism first-hand. Before #41 this reached Home Assistant as a
+        #    healthy hub, because is_connected() only asked whether the socket
+        #    opened.
+        #
+        #    This is the check the map's bar says a green suite cannot buy on
+        #    its own, so it is written to fail loudly rather than pass vacuously:
+        #    remove the gate and is_connected() goes true here.
+        reconnects_before = client.get_reconnect_count()
+        unanswered_before = client.get_unanswered_attempt_count()
+        failed_before = client.get_failed_attempt_count()
+
+        quirks.set_mute(True)
+        muted_drop = await quirks.simulate_connection_failure()
+        check("#41 live: dropped the connection into a muted hub", muted_drop is True)
+
+        await _wait_until(lambda: not client.is_connected(), timeout=15)
+
+        # The window has to outlast the *watchdog*, not just the backoff: a
+        # hub-side close is noticed immediately, but nothing retries until
+        # maintain_connection_worker returns a verdict, which is up to
+        # 2 * PING_WORKER_WAIT_S away. Then each attempt opens a socket, waits
+        # out the 3s ping budget and climbs the backoff ladder. Run until two
+        # stuck attempts have been seen rather than for a fixed time, so the
+        # check below cannot pass vacuously by never having attempted anything.
+        stuck_watch_s = 2 * PING_WORKER_WAIT_S + 25
+        stuck_deadline = asyncio.get_running_loop().time() + stuck_watch_s
+        falsely_connected = False
+        while asyncio.get_running_loop().time() < stuck_deadline:
+            await asyncio.sleep(0.5)
+            if client.is_connected():
+                falsely_connected = True
+                break
+            if client.get_unanswered_attempt_count() - unanswered_before >= 2:
+                break
+
+        unanswered = client.get_unanswered_attempt_count() - unanswered_before
+        check(
+            "#41 live: a socket the hub never answers is not reported connected",
+            not falsely_connected and unanswered >= 2,
+            f"{unanswered} attempt(s) opened a socket to a hub that serves "
+            "nothing, and none of them was reported as a connection; before "
+            "#41 the first one read as a live hub with every light available "
+            "and commands vanishing into it",
+        )
+        check(
+            "#41 live: the stuck attempts were counted, and counted as stuck",
+            unanswered > 0
+            and client.get_failed_attempt_count() - failed_before >= unanswered,
+            f"unanswered_attempts +{unanswered} "
+            f"(failed_attempts +{client.get_failed_attempt_count() - failed_before}) "
+            "-- #32 closed with no instrument that would explain the next burst",
+        )
+        check(
+            "#41 live: a stuck slot does not inflate the reconnect count",
+            client.get_reconnect_count() == reconnects_before,
+            f"reconnects={client.get_reconnect_count()}, was {reconnects_before} "
+            "-- before #41 each knock on a door that had not finished closing "
+            "was logged as an arrival",
+        )
+
+        # And it still recovers unaided once the hub starts answering, which is
+        # the property #19 proved and the house depends on.
+        quirks.set_mute(False)
+        recovered = await _wait_until(client.is_connected, timeout=30)
+        check(
+            "#41 live: the connection recovers unaided once the hub answers",
+            recovered,
+            f"reconnects={client.get_reconnect_count()} "
+            f"(was {reconnects_before}); retry is forever, backoff capped at "
+            "the cadence #19 measured as survivable",
+        )
+        check(
+            "#41 live: only the proven connection was counted",
+            client.get_reconnect_count() == reconnects_before + 1,
+            f"reconnects={client.get_reconnect_count()} after {unanswered} "
+            "stuck attempts and one real recovery",
         )
 
         await client.disconnect()

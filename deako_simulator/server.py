@@ -443,7 +443,46 @@ class DeakoSimulator:
                 f"Applying connection delay: {connection_delay}s for {client_ip}"
             )
             await asyncio.sleep(connection_delay)
-        
+
+        # The stuck exclusive slot (wayfinder #41). Accept the socket and serve
+        # nothing across it -- what a node still holding a previous telnet
+        # session does, because the ESP32 network stack completes the handshake
+        # a layer below the application that is stuck.
+        #
+        # Deliberately not registered as the active connection: the application
+        # never got this one, so nothing it would have driven happens either.
+        if self.quirk_manager.should_mute_connection():
+            close_after = self.quirk_manager.get_mute_close_after()
+            connection_logger.info(
+                f"Connection from {client_ip} MUTED "
+                f"(accepted, serving nothing, close_after={close_after}s)"
+            )
+            try:
+                if close_after > 0:
+                    # The node closes it itself, as the house node did after 13s
+                    # in #32. Anything the client sends is read and dropped, so
+                    # its writes still succeed -- which is the trap.
+                    try:
+                        await asyncio.wait_for(reader.read(), close_after)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    # Held open until the client gives up. Nothing at all tells
+                    # it the socket is useless.
+                    while await reader.read(4096):
+                        pass
+            except Exception:
+                # EXPECTED: the client closing or resetting the socket.
+                # RECOVERY: fall through to the close below; nothing was served.
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            return
+
         # Log connection event per FR-048
         connection_logger.info(f"Connection from {client_ip}")
         

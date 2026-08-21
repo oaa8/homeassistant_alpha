@@ -68,6 +68,23 @@ class QuirkConfig:
     refuse_connections: bool = False  # Reject incoming connections
     connection_delay: float = 0.0  # Delay before processing any message (latency simulation)
 
+    # Stuck exclusive slot (wayfinder #41).
+    #
+    # This one IS hub behaviour, and it is why #41 exists. Deako's telnet server
+    # is exclusive, and on an ESP32 the network stack completes the handshake a
+    # layer below the telnet application -- so a node still holding a previous
+    # session accepts the TCP connection and then serves nothing across it.
+    # Observed in the house, not invented: wayfinder #32 caught a node accepting
+    # a connection, serving nothing for 13s, then closing it itself, and the map
+    # owner confirmed the mechanism first-hand.
+    #
+    # The distinction from refuse_connections is the whole point. A refusal is
+    # honest and the integration has always handled it. This is the dishonest
+    # one: it looks like a healthy connection to anything that only asks whether
+    # the socket opened.
+    mute_connections: bool = False  # Accept the socket, then serve nothing
+    mute_close_after: float = 0.0  # Seconds before the node closes it (0 = never)
+
 
 class QuirkManager:
     """Manages protocol quirk simulation for integration testing.
@@ -192,13 +209,42 @@ class QuirkManager:
     
     def set_connection_delay(self, delay_seconds: float) -> None:
         """Set artificial connection latency for resilience testing.
-        
+
         Args:
             delay_seconds: Delay before processing messages (simulates high latency)
         """
         self.config.connection_delay = delay_seconds
         logger.info("Connection latency simulation: %.2fs", delay_seconds)
-    
+
+    def set_mute(self, mute: bool, close_after: float = 0.0) -> None:
+        """Accept connections and then serve nothing across them (#41).
+
+        The stuck exclusive slot. See QuirkConfig.mute_connections for why this
+        is modelled hub behaviour rather than fault injection.
+
+        Args:
+            mute: True to accept-and-ignore new connections
+            close_after: Seconds before the simulator closes the muted
+                connection itself, as the house node did after 13s in #32.
+                0 leaves it open indefinitely, which is the harder case: there
+                is then nothing at all to tell the client its socket is useless.
+        """
+        self.config.mute_connections = mute
+        self.config.mute_close_after = close_after
+        logger.info(
+            "Muted connections: %s (close_after=%.1fs)",
+            "ENABLED" if mute else "disabled",
+            close_after,
+        )
+
+    def should_mute_connection(self) -> bool:
+        """Return whether a new connection should be accepted but not served."""
+        return self.config.mute_connections
+
+    def get_mute_close_after(self) -> float:
+        """Return how long a muted connection is held before being closed."""
+        return self.config.mute_close_after
+
     def set_active_connection(self, writer: Optional[asyncio.StreamWriter]) -> None:
         """Set the active connection for connection failure simulation.
         
