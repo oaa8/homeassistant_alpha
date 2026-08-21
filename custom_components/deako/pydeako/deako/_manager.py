@@ -17,13 +17,32 @@ from ..models import (
     state_change_request,
     ResponseType,
 )
-from .utils import _Connection
+from .utils import _Connection, ConnectionState
 from ._request import _Request
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
-CONNECTED_POLLING_INTERVAL_S = 1
-CONNECTION_TIMEOUT_S = 10
+# DEVIATION (wayfinder #41): what used to be one 10 s per-attempt budget,
+# spent a second at a time by a poll that never asked whether the socket had
+# already failed, is now three named numbers with three different jobs.
+#
+# CONNECT_TIMEOUT_S bounds the TCP connect and nothing else. A refused connect
+# no longer costs any of it -- the socket's own state change ends the wait in
+# under a millisecond -- but a node that answers no SYN at all still has to be
+# given up on by us, because the kernel would take ~2 minutes to do it. #38
+# measured the 7-11 s outages and found the 7/8/10 s cases were SYN retransmits
+# against a silent node, which no amount of event-driving touches; this keeps
+# our budget for that case exactly where it was.
+CONNECT_TIMEOUT_S = 10
+# HANDSHAKE_PONG_TIMEOUT_S is the new gate: a socket is not a connection until
+# the hub has answered on it. See init_connection.
+HANDSHAKE_PONG_TIMEOUT_S = 3
+# Backoff between failed attempts: immediate first attempt, then 1, 2, 4, 8,
+# capped. The cap is 10 s deliberately -- that is the cadence #19 measured as
+# survivable against a dead node, so steady state is never more aggressive than
+# the code already running in the house.
+RETRY_BACKOFF_START_S = 1
+RETRY_BACKOFF_MAX_S = 10
 WORKER_WAIT_S = 0.5
 PING_WORKER_WAIT_S = 10
 
@@ -55,6 +74,7 @@ class _Manager:
         client_name: str | None = None,
         on_connect: Callable[[], Awaitable[None]] | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
+        on_connection_attempt: Callable[[], None] | None = None,
     ) -> None:
         """Initialize with get address function and incoming json callback."""
         self.get_address = get_address
@@ -87,9 +107,60 @@ class _Manager:
         # ever read as a difference.
         self.last_message_at: float | None = None
         self.reconnect_count = 0
+        # DEVIATION (wayfinder #41): #32 closed with the loose end that there
+        # was no instrument that would explain the next burst of drops. These
+        # two are it, for the price of an attribute on the existing sensor.
+        #
+        # They are deliberately separate questions. A node that answers no SYN
+        # is a node that is away; a socket that opens and then never answers a
+        # ping is the *stuck exclusive slot* -- the shape #32 caught and read as
+        # a node symptom, and the reason this change exists at all.
+        self.failed_connection_attempts = 0
+        self.unanswered_connection_attempts = 0
+        self.on_connection_attempt = on_connection_attempt
+        # Woken by anything an in-flight connection attempt is waiting on: a
+        # transition of the socket's state machine, or the pong that proves the
+        # hub is there. One event rather than two because only one attempt can
+        # be in flight at a time -- state.connecting guarantees it.
+        self._attempt_event = asyncio.Event()
+        # Delay before the *next* retry. Zero means none has been served yet,
+        # so the first attempt after a loss is immediate; one clean reconnect on
+        # cutover night cost 1 s, so a settle delay before the first attempt
+        # would tax the good case for the bad one. It is never zero again until
+        # a connection is proven -- an unbounded retry loop is what the old
+        # 10.02 s was accidentally preventing.
+        self._retry_delay_s: float = 0
 
     async def init_connection(self) -> None:
-        """Initialize the connection process."""
+        """Build a connection, and do not report one until the hub answers.
+
+        DEVIATION (wayfinder #41). Two things were wrong here, and the second
+        one is why this was worth touching.
+
+        The loop this replaces polled ``connection.is_connected()`` once a
+        second up to a 10 s budget and never asked whether the socket had
+        already *failed*. A connect refused in under a millisecond therefore
+        cost the full 10 s, and a successful connect still cost one poll tick.
+        The signal to wait on already existed -- the O5 deviation announces
+        every transition of ``_Connection.state``, and every path that loses the
+        socket runs through it.
+
+        And ``is_connected()`` was satisfied by a TCP handshake alone: it never
+        required the hub to have said anything. Deako's telnet server is
+        exclusive, and on an ESP32 the network stack completes the handshake a
+        layer below the telnet application, so a *stuck* slot -- the previous
+        session not yet released -- accepts our connection and then serves
+        nothing across it. #32 caught exactly that for 13 s, during which Home
+        Assistant showed 37 available lights serving cached state and would have
+        taken commands into a socket going nowhere. Our own reconnect is the
+        second connector the map has always warned about.
+
+        So a socket is now only a connection once a **correlated PONG** has come
+        back over it. A ping is used rather than the device-list resync because
+        it is symmetric across first connect and reconnect, is one small message
+        rather than a 37-device burst, and sends no ``CONTROL``, so no light
+        moves.
+        """
         if self.state.connecting:
             _LOGGER.error("Already attempting to connect")
             return
@@ -98,8 +169,7 @@ class _Manager:
             address, name = await self.get_address()
         except DevicesNotFoundException:
             _LOGGER.warning("No devices to connect to")
-            self.create_connection_task()
-            self.state.connecting = False
+            self.fail_attempt()
             return
         connection = _Connection(
             address,
@@ -110,27 +180,55 @@ class _Manager:
             # manager being told. Hooking the transition is what makes
             # "unavailable" arrive in half a second rather than waiting on the
             # next ping window.
-            on_state_change=self.notify_connection_change,
+            #
+            # DEVIATION (wayfinder #41): and it is now also what ends the wait
+            # below, so a refusal is known when it happens rather than when a
+            # timer next looks.
+            on_state_change=self.on_connection_state_change,
         )
-        timeout = 0
-        while not connection.is_connected() and timeout < CONNECTION_TIMEOUT_S:
-            await asyncio.sleep(CONNECTED_POLLING_INTERVAL_S)
-            timeout += CONNECTED_POLLING_INTERVAL_S
-        if timeout == CONNECTION_TIMEOUT_S:
-            _LOGGER.error("Timeout attempting to connect. Trying again")
-            self.state.connecting = False
-            connection.close()
-            self.notify_connection_change()
-            self.create_connection_task()
+
+        loop = asyncio.get_running_loop()
+        connected = await self.wait_until(
+            lambda: connection.state != ConnectionState.NOT_STARTED,
+            loop.time() + CONNECT_TIMEOUT_S,
+        ) and connection.is_connected()
+        if not connected:
+            _LOGGER.warning(
+                "Could not open a socket to %s. Trying again",
+                connection.format_name(),
+            )
+            self.abandon(connection)
             return
+
+        if not await self.handshake(connection):
+            # The socket opened and the hub said nothing back. Reported
+            # separately because it is the stuck-slot shape, not an absent node.
+            self.unanswered_connection_attempts += 1
+            _LOGGER.warning(
+                "Socket to %s opened but the hub did not answer a ping in %ss. "
+                "Not reporting this as a connection",
+                connection.format_name(),
+                HANDSHAKE_PONG_TIMEOUT_S,
+            )
+            self.abandon(connection)
+            return
+
         self.connection = connection
         # init connection watching
+        #
+        # DEVIATION (wayfinder #41): started only now, and this ordering is
+        # load-bearing. maintain_connection_worker uses the same
+        # pending_ping_id / pong_received slot the handshake above needs, so a
+        # worker running during the handshake would answer its question -- and
+        # quietly restore the stock behaviour the O4 deviation exists to
+        # prevent. The handshake is finished before the worker exists.
         if self.maintain_worker is None:
             self.state.canceled = False
             self.maintain_worker = asyncio.create_task(
                 self.maintain_connection_worker()
             )
         self.state.connecting = False
+        self._retry_delay_s = 0
         # is_connected() needs `self.connection` set and `canceled` cleared,
         # neither of which was true when the socket announced CONNECTED above,
         # so that transition reported "still down". Ask again now that all
@@ -152,13 +250,108 @@ class _Manager:
         if was_reconnect:
             # DEVIATION (wayfinder #23): counted here rather than at the point
             # the connection is dropped, so it counts connections that came
-            # back rather than attempts that were made. There is no backoff in
-            # 0.6.0 -- a dead node is retried about 6 times a minute (#19) --
-            # so a count of attempts would measure the length of one outage,
-            # not the number of them.
+            # back rather than attempts that were made.
+            #
+            # DEVIATION (wayfinder #41): and it now counts connections the hub
+            # has *answered on*. Before this it counted arrivals at a socket,
+            # which is why #32's ten reconnects were not ten node failures --
+            # some of them were us knocking on a door that had not finished
+            # closing, and logging each knock as an arrival. The counter's
+            # meaning changes at this release and recorder history is not
+            # comparable across it. Attempts that failed are counted separately,
+            # as attributes on the same sensor.
             self.reconnect_count += 1
         if was_reconnect and self.on_connect is not None:
             await self.on_connect()
+
+    async def handshake(self, connection: _Connection) -> bool:
+        """Ask the hub to say something, and report whether it did.
+
+        DEVIATION (wayfinder #41): the gate that makes a socket a connection.
+        One PING, and the *correlated* PONG within HANDSHAKE_PONG_TIMEOUT_S --
+        correlation being the same strictness the O4 watchdog uses, and proven
+        against real firmware in #19, which captured the hub echoing the
+        transaction id.
+
+        Sent over the connection directly rather than through send_request,
+        because `self.connection` is deliberately still unset: nothing may
+        observe this socket as live until the answer is in.
+        """
+        ping = device_ping_request(source=self.client_name)
+        self.pending_ping_id = ping.get("transactionId")
+        self.pong_received = False
+        if not await connection.send_data(_Request(ping).get_body_str()):
+            return False
+        loop = asyncio.get_running_loop()
+        return await self.wait_until(
+            # A socket that dies mid-handshake fails the attempt immediately
+            # rather than serving out the budget.
+            lambda: self.pong_received or not connection.is_connected(),
+            loop.time() + HANDSHAKE_PONG_TIMEOUT_S,
+        ) and self.pong_received
+
+    async def wait_until(self, predicate, deadline: float) -> bool:
+        """Wait for predicate() to hold, or for the deadline to pass.
+
+        DEVIATION (wayfinder #41): this is the poll's replacement. Everything a
+        connection attempt waits on -- the socket's state machine and the
+        arrival of the pong -- pokes `_attempt_event`, so the wait ends when the
+        thing happens rather than on the next tick of a timer.
+
+        Cleared before the predicate is read, so a wakeup that arrived while we
+        were not waiting is not lost: whatever set it has already had its effect
+        on the predicate by the time it is asked.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            self._attempt_event.clear()
+            if predicate():
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(self._attempt_event.wait(), remaining)
+            except (asyncio.TimeoutError, TimeoutError):
+                return predicate()
+
+    def on_connection_state_change(self) -> None:
+        """Announce the transition, and wake any attempt waiting on it."""
+        self._attempt_event.set()
+        self.notify_connection_change()
+
+    def abandon(self, connection: _Connection) -> None:
+        """Give up on a connection that never proved itself, and retry."""
+        connection.close()
+        self.notify_connection_change()
+        self.fail_attempt()
+
+    def fail_attempt(self) -> None:
+        """Record a failed attempt and schedule the next one.
+
+        DEVIATION (wayfinder #41): the retry cadence lives here, in one place,
+        and is deliberate rather than emergent. It used to be
+        `CONNECTION_TIMEOUT_S` showing through -- a flat 10.02 s between
+        attempts that nobody chose, and which #19 recorded as a measured churn
+        rate of 6/min. Delay is never zero: `create_connection_task` ->
+        `init_connection` -> refusal in under a millisecond -> repeat is bounded
+        only by event-loop scheduling, and that flat 10 s was the only thing
+        serialising retries.
+        """
+        self.failed_connection_attempts += 1
+        self.state.connecting = False
+        if self._retry_delay_s <= 0:
+            self._retry_delay_s = RETRY_BACKOFF_START_S
+        else:
+            self._retry_delay_s = min(
+                self._retry_delay_s * 2, RETRY_BACKOFF_MAX_S,
+            )
+        if self.on_connection_attempt is not None:
+            try:
+                self.on_connection_attempt()
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Connection attempt listener failed: %s", exc)
+        self.create_connection_task(self._retry_delay_s)
 
     def is_connected(self) -> bool:
         """Report whether there is a live connection.
@@ -205,6 +398,11 @@ class _Manager:
         """Close connection."""
         _LOGGER.debug("Closing connection and canceling workers")
         self.state.canceled = True
+        # DEVIATION (wayfinder #41): an attempt in flight is about to be
+        # cancelled at its next await, so the code that would have cleared this
+        # never runs. Left set, it makes every future init_connection return
+        # "Already attempting to connect" and nothing ever reconnects again.
+        self.state.connecting = False
 
         # Cancel and clear all pending tasks
         for task in self.tasks:
@@ -227,13 +425,18 @@ class _Manager:
         # else happened to ask.
         self.notify_connection_change()
 
-    def create_connection_task(self):
-        """Create an async task to initiate connection."""
+    def create_connection_task(self, delay: float = 0):
+        """Create an async task to initiate connection, after `delay` seconds.
+
+        DEVIATION (wayfinder #41): the delay is how backoff is served. It is
+        held here rather than inside init_connection so that close() cancelling
+        `self.tasks` also cancels a retry that has not fired yet.
+        """
         # RUF006
         # pylint: disable-next=line-too-long
         # noqa keep reference via: https://stackoverflow.com/questions/71938799/python-asyncio-create-task-really-need-to-keep-a-reference
         # even if we don't care
-        task = asyncio.create_task(self.init_connection())
+        task = asyncio.create_task(self.connect_after(delay))
         self.tasks.add(task)
 
         def remove_task(_task):
@@ -243,6 +446,13 @@ class _Manager:
                 pass  # already removed
 
         task.add_done_callback(remove_task)
+
+    async def connect_after(self, delay: float) -> None:
+        """Wait out the backoff, then attempt a connection."""
+        if delay > 0:
+            _LOGGER.info("Retrying the hub connection in %ss", delay)
+            await asyncio.sleep(delay)
+        await self.init_connection()
 
     async def maintain_connection_worker(self) -> None:
         """Monitor connection and restart if there's a failure."""
@@ -311,6 +521,8 @@ class _Manager:
                 and transaction_id == self.pending_ping_id
             ):
                 self.pong_received = True
+                # DEVIATION (wayfinder #41): the handshake waits on this.
+                self._attempt_event.set()
             else:
                 _LOGGER.debug(
                     "Ignoring pong for ping %s, waiting on %s",
