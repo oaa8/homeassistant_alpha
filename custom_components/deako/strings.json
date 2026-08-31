@@ -62,6 +62,12 @@
       "devices_reporting": {
         "name": "Devices reporting"
       },
+      "unreachable_devices": {
+        "name": "Switches marked unreachable"
+      },
+      "asymmetry_probes": {
+        "name": "Asymmetry probes"
+      },
       "last_probed": {
         "name": "Last probed"
       },
@@ -70,6 +76,13 @@
         "state": {
           "on": "On",
           "off": "Off"
+        }
+      },
+      "last_probe_outcome": {
+        "name": "Last probe outcome",
+        "state": {
+          "answered": "Answered",
+          "no_answer": "No answer"
         }
       },
       "last_probe_pass": {

@@ -124,6 +124,26 @@ RETRY_DELAY_S = 30
 # miss.
 ACK_WINDOW_S = 2
 
+# DEVIATION (wayfinder #43/#45): the asymmetry measurement, and nothing else.
+#
+# #43 left one question that twelve days of history cannot separate. A switch
+# marked `unreachable` that then emits an EVENT has two readings that fit every
+# measurement taken so far:
+#
+#   intermittent -- genuinely reachable for a couple of minutes, then gone
+#   asymmetric   -- it can report but never obey, so `online` was never true
+#
+# The median life of a cleared mark is 2.2 minutes, so the hourly probe will
+# nearly always miss the window. The only instrument that fits inside it is a
+# single CONTROL sent the moment the EVENT lands, and that is all this is.
+#
+# **It defends against nothing.** Asymmetry has never been observed, and this
+# map's rule is that mechanisms are not kept against faults nobody has seen. So
+# it does not gate the clear -- the mark clears on the EVENT, as it already did
+# -- it counts no misses, it can neither set nor lift a mark, and if the
+# measurement comes back empty nothing is built on it.
+ASYMMETRY_WINDOW_S = WITNESS_WINDOW_S
+
 
 class Deako:
     """Deako specific socket api."""
@@ -187,11 +207,11 @@ class Deako:
         self.consecutive_misses: dict[str, int] = {}
         self.pending_witness: dict[str, asyncio.Task] = {}
         # DEVIATION (wayfinder #26): when the mesh last spoke for each device,
-        # on the monotonic clock. The probe skips a device the passive detector
-        # has already confirmed this cycle, and "already confirmed" is a
-        # question about time, so the answer has to be kept rather than
-        # inferred from the miss counters -- those are cleared by a witness and
-        # so cannot say when it happened.
+        # on the monotonic clock. The probe decides whether a device answered
+        # by asking whether the mesh spoke for it *after* the write went out,
+        # and that is a question about time, so the answer has to be kept
+        # rather than inferred from the miss counters -- those are cleared by a
+        # witness and so cannot say when it happened.
         self.last_witness: dict[str, float] = {}
         # DEVIATION (wayfinder #26): the retries that bring a second miss
         # forward. See RETRY_DELAY_S.
@@ -217,6 +237,13 @@ class Deako:
         self.witness_transaction: dict[str, str] = {}
         self.dropped_commands = 0
         self.drop_listeners: list[Callable[[], None]] = []
+        # DEVIATION (wayfinder #43/#45): the asymmetry measurement. See
+        # ASYMMETRY_WINDOW_S. Nothing reads these but the sensor that reports
+        # them, and nothing branches on them.
+        self.pending_asymmetry: dict[str, asyncio.Task] = {}
+        self.asymmetry_probes = 0
+        self.asymmetry_witnessed = 0
+        self.asymmetry_listeners: list[Callable[[], None]] = []
 
     def add_connection_listener(
         self, listener: Callable[[bool], None],
@@ -532,6 +559,10 @@ class Deako:
             elif in_data["type"] == ResponseType.EVENT:
                 subdata = in_data["data"]
                 state = subdata["state"]
+                # DEVIATION (wayfinder #43/#45): read before witness_device()
+                # clears it, because the whole question is about switches that
+                # were marked at the moment they spoke.
+                was_marked = subdata["target"] in self.unreachable
                 # DEVIATION (wayfinder #23): an EVENT is the only message the
                 # mesh sources, so it is the only thing that witnesses a
                 # device. Done before update_state, which returns early for a
@@ -540,6 +571,12 @@ class Deako:
                 self.update_state(
                     subdata["target"], state["power"], state.get("dim"),
                 )
+                if was_marked:
+                    # Ordered *after* update_state deliberately: the echo has
+                    # to carry the value this EVENT just brought, not the stale
+                    # one it replaced, or the measurement would fight whatever
+                    # actually moved the light (wayfinder #44).
+                    self.probe_asymmetry(subdata["target"])
             elif in_data["type"] == ResponseType.CONTROL:
                 # DEVIATION (wayfinder #37/#39): the acknowledgement, which
                 # stock discarded because ResponseType had no member for it.
@@ -1006,6 +1043,105 @@ class Deako:
         for task in self.pending_retry.values():
             task.cancel()
         self.pending_retry = {}
+        # The asymmetry measurement goes too (wayfinder #45): its command was
+        # in flight on a socket that died, so it is not evidence either way.
+        for task in self.pending_asymmetry.values():
+            task.cancel()
+        self.pending_asymmetry = {}
+
+    # -- the asymmetry measurement (DEVIATION, wayfinder #43/#45) -----------
+
+    def add_asymmetry_listener(self, listener: Callable[[], None]) -> None:
+        """Register a listener for the asymmetry counts moving."""
+        if listener not in self.asymmetry_listeners:
+            self.asymmetry_listeners.append(listener)
+
+    def remove_asymmetry_listener(self, listener: Callable[[], None]) -> None:
+        """Unregister an asymmetry listener."""
+        if listener in self.asymmetry_listeners:
+            self.asymmetry_listeners.remove(listener)
+
+    def notify_asymmetry_listeners(self) -> None:
+        """Tell whoever reports the measurement that it moved."""
+        for listener in list(self.asymmetry_listeners):
+            try:
+                listener()
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _LOGGER.error("Asymmetry listener failed: %s", exc)
+
+    def get_asymmetry_counts(self) -> tuple[int, int]:
+        """Return (probes sent, probes witnessed) for the measurement."""
+        return self.asymmetry_probes, self.asymmetry_witnessed
+
+    def probe_asymmetry(self, uuid: str) -> None:
+        """Ask a just-spoken marked switch whether it can also obey.
+
+        DEVIATION (wayfinder #43/#45). See ASYMMETRY_WINDOW_S for why this
+        exists and what it is forbidden from doing.
+
+        One command per clear, on marked devices only -- so roughly one extra
+        write an hour in this house, against the 37 the hourly pass already
+        sends. A second EVENT arriving while one is still in flight is not a
+        second question, so it is ignored rather than stacked.
+        """
+        if uuid in self.pending_asymmetry:
+            return
+        if not self.is_connected():
+            return
+        self.pending_asymmetry[uuid] = asyncio.create_task(
+            self.asymmetry_probe(uuid)
+        )
+
+    async def asymmetry_probe(self, uuid: str) -> None:
+        """Send one CONTROL and record only whether it was witnessed.
+
+        DEVIATION (wayfinder #43/#45).
+
+        The echo is the device's own cache, refreshed by the EVENT that
+        triggered this a moment ago, so this cannot drive a light anywhere it
+        did not just report being. That ordering is the whole safety argument
+        and it is asserted by where probe_asymmetry() is called from.
+
+        Sent with `observe_only`, which is what keeps this a measurement: no
+        witness window opens, so no miss is counted, no retry is scheduled, and
+        nothing here can set or lift a mark. The verdict is read from
+        `last_witness` afterwards instead -- the same evidence the probe's own
+        pass uses, read without arming the machinery that acts on it.
+        """
+        try:
+            state = self.get_state(uuid) or {}
+            power = bool(state.get("power", False))
+            # Same rule as the pass: a dim only ever travels with `on`.
+            dim = state.get("dim") if power else None
+
+            sent_at = time.monotonic()
+            if not await self.send_command(
+                uuid, power, dim, observe_only=True,
+            ):
+                _LOGGER.debug(
+                    "Could not measure asymmetry on %s: the command did not "
+                    "leave", uuid,
+                )
+                return
+
+            self.asymmetry_probes += 1
+            await asyncio.sleep(ASYMMETRY_WINDOW_S)
+
+            seen = self.last_witness.get(uuid)
+            witnessed = seen is not None and seen >= sent_at
+            if witnessed:
+                self.asymmetry_witnessed += 1
+            _LOGGER.warning(
+                "Asymmetry measurement on %s: it reported, and the CONTROL "
+                "sent straight back at it was %s (%i of %i witnessed so far)",
+                uuid,
+                "witnessed" if witnessed else "NOT witnessed",
+                self.asymmetry_witnessed,
+                self.asymmetry_probes,
+            )
+            self.notify_asymmetry_listeners()
+        finally:
+            self.pending_asymmetry.pop(uuid, None)
 
     async def connect(self) -> None:
         """Initiate the connection sequence."""
@@ -1125,7 +1261,7 @@ class Deako:
 
     async def send_command(
         self, uuid: str, power: bool, dim: int | None = None,
-        is_retry: bool = False,
+        is_retry: bool = False, observe_only: bool = False,
     ) -> bool:
         """Put one CONTROL on the wire and start watching for its answers.
 
@@ -1133,6 +1269,15 @@ class Deako:
         different questions: the hub's acknowledgement, which says the command
         was taken and drives the optimistic UI update, and the switch's EVENT,
         which says the light actually moved (wayfinder #23).
+
+        `observe_only` (wayfinder #45) opens neither. The ack is still
+        correlated -- whether the *hub* took a command is a fact about the hub,
+        and the drop counter should not develop a blind spot -- but no witness
+        window opens, so the command counts no miss against the device, starts
+        no retry, and cannot set or lift a mark. It also shows nothing
+        optimistically, because acknowledge_command() only does that while a
+        witness window is open to take it back again. Used by the asymmetry
+        measurement, which must observe the detector without feeding it.
         """
         transaction_id = str(uuid4())
         # Registered before the send, armed after it: see register_ack.
@@ -1155,11 +1300,12 @@ class Deako:
             return False
 
         self.arm_ack_window(transaction_id)
-        # DEVIATION (wayfinder #23): the command that just left is the probe.
-        # Started only once the bytes are away, so a send that never happened
-        # is not counted against the device. The command travels with the
-        # window (wayfinder #26) so a first miss can be re-asked.
-        self.watch_for_witness(uuid, power, dim, is_retry, transaction_id)
+        if not observe_only:
+            # DEVIATION (wayfinder #23): the command that just left is the
+            # probe. Started only once the bytes are away, so a send that never
+            # happened is not counted against the device. The command travels
+            # with the window (wayfinder #26) so a first miss can be re-asked.
+            self.watch_for_witness(uuid, power, dim, is_retry, transaction_id)
         return True
 
     def get_name(self, uuid: str) -> str | None:

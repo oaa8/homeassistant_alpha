@@ -99,6 +99,7 @@ class _StubManager:
     def __init__(self, send_ok: bool = True) -> None:
         self.device_list_requests = 0
         self.state_changes = 0
+        self.commands: list[tuple[str, bool, int | None]] = []
         self.send_ok = send_ok
         self.connected = False
         self.reconnect_count = 0
@@ -119,6 +120,7 @@ class _StubManager:
         completed_callback=None,
     ) -> bool:
         self.state_changes += 1
+        self.commands.append((uuid, power, dim))
         self.transaction_ids.append(transaction_id)
         if self.send_ok and self.ack_sends and self.deako is not None:
             # Delivered on the next loop pass rather than inline, which is what
@@ -394,7 +396,7 @@ async def offline_checks() -> None:
         finally:
             deako_module.RETRY_DELAY_S = original_retry
 
-        # -- wayfinder #26: the witness clock the probe skips devices by ------
+        # -- wayfinder #45: the witness clock the probe reads answers from ----
         deako, _ = _stub_deako()
         deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
         check(
@@ -412,10 +414,127 @@ async def offline_checks() -> None:
         check(
             "#26 an EVENT stamps when the mesh spoke for the device",
             witnessed_at is not None and witnessed_at >= before,
-            f"witnessed_at={witnessed_at} -- the probe skips a device the "
-            "passive detector already confirmed this cycle, and that is a "
-            "question about time",
+            f"witnessed_at={witnessed_at} -- a pass decides a device answered "
+            "by asking whether the mesh spoke for it after the write went out, "
+            "and that is a question about time",
         )
+
+        # -- wayfinder #45: the asymmetry measurement -------------------------
+        #
+        # #43 could not separate "intermittent" from "asymmetric" on twelve
+        # days of house history, because the median cleared mark lives 2.2
+        # minutes and the pass is hourly. This is the instrument that fits
+        # inside that window. What matters as much as it firing is what it is
+        # forbidden from doing: it must not gate the clear, and it must not
+        # feed the detector it is measuring.
+        original_asymmetry = deako_module.ASYMMETRY_WINDOW_S
+        deako_module.ASYMMETRY_WINDOW_S = 0.05
+        try:
+            # A device nobody has marked is not part of the question.
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+            })
+            await asyncio.sleep(0.2)
+            check(
+                "#45 an EVENT from an unmarked switch measures nothing",
+                manager.state_changes == 0
+                and deako.get_asymmetry_counts() == (0, 0),
+                f"sends={manager.state_changes}, "
+                f"counts={deako.get_asymmetry_counts()} -- marked devices "
+                "only, which is what keeps this ~one command per clear",
+            )
+
+            # A marked one is, and the echo carries what the EVENT just
+            # brought. Ordered after update_state deliberately: an echo of the
+            # stale value would fight whatever actually moved the light (#44).
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            deako.unreachable.add(DIMMABLE_UUID)
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+            })
+            await asyncio.sleep(0.2)
+            check(
+                "#45 an EVENT from a marked switch sends one echo of the "
+                "state that EVENT brought",
+                manager.commands == [(DIMMABLE_UUID, False, None)],
+                f"commands={manager.commands} -- the stale cache said "
+                "power=True dim=80; echoing that would have re-lit the light",
+            )
+            check(
+                "#45 the measurement does not gate the clear",
+                deako.is_reachable(DIMMABLE_UUID),
+                f"unreachable={deako.get_unreachable()} -- the mark clears on "
+                "the EVENT exactly as it did before",
+            )
+            check(
+                "#45 the measurement opens no witness window and counts no "
+                "miss",
+                deako.pending_witness == {}
+                and DIMMABLE_UUID not in deako.consecutive_misses
+                and deako.pending_retry == {},
+                f"pending={deako.pending_witness}, "
+                f"misses={deako.consecutive_misses}, "
+                f"retries={deako.pending_retry} -- it observes the detector, "
+                "it must not feed it",
+            )
+            check(
+                "#45 an unanswered measurement is recorded as unwitnessed",
+                deako.get_asymmetry_counts() == (1, 0),
+                f"counts={deako.get_asymmetry_counts()} -- one probe sent, "
+                "no EVENT followed it",
+            )
+
+            # And the intermittent reading, which is the other half of the
+            # question: it reported, and it also obeyed.
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            deako.unreachable.add(DIMMABLE_UUID)
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+            })
+            await asyncio.sleep(0)
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+            })
+            await asyncio.sleep(0.2)
+            check(
+                "#45 a measurement the switch answers is recorded witnessed",
+                deako.get_asymmetry_counts() == (1, 1),
+                f"counts={deako.get_asymmetry_counts()} -- the switch reported "
+                "and then obeyed, which is the intermittent reading",
+            )
+
+            # A command in flight when the socket died is not evidence.
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            deako.unreachable.add(DIMMABLE_UUID)
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {"target": DIMMABLE_UUID, "state": {"power": False}},
+            })
+            await asyncio.sleep(0)
+            deako.notify_connection_listeners(False)
+            await asyncio.sleep(0.2)
+            check(
+                "#45 losing the connection abandons the measurement",
+                deako.pending_asymmetry == {}
+                and deako.get_asymmetry_counts()[1] == 0,
+                f"pending={deako.pending_asymmetry}, "
+                f"counts={deako.get_asymmetry_counts()}",
+            )
+        finally:
+            deako_module.ASYMMETRY_WINDOW_S = original_asymmetry
     finally:
         deako_module.WITNESS_WINDOW_S = original_window
 

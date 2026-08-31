@@ -20,6 +20,14 @@ Wayfinder #39 adds **unacknowledged commands** on the hub: commands the hub
 never answered at all. It is deliberately a different question from the node
 status sensor's -- see DeakoDroppedCommands.
 
+Wayfinder #45 adds a third per-switch record, **last probe outcome**, and two
+more hub readings: **switches marked unreachable**, which counts the same set
+the per-switch sensors report one at a time, and **asymmetry probes**, which is
+a measurement of an open question rather than a diagnostic. Read
+DeakoUnreachableDevices on why the marked count and the probe pair are supposed
+to differ, and DeakoAsymmetryProbes on what is being measured and what happens
+if it comes back empty.
+
 What the node status sensor honestly cannot say is set out on
 DeakoNodeStatus below. Read it before building anything on top of this.
 """
@@ -52,6 +60,9 @@ from .const import (
     NODE_STATUS_OPTIONS,
     NODE_STATUS_UNREACHABLE,
     PROBE_DATA,
+    PROBE_OUTCOME_ANSWERED,
+    PROBE_OUTCOME_NO_ANSWER,
+    PROBE_OUTCOME_OPTIONS,
     PROBE_VALUE_OFF,
     PROBE_VALUE_ON,
     PROBE_VALUE_OPTIONS,
@@ -77,6 +88,8 @@ async def async_setup_entry(
             DeakoDroppedCommands(client, config),
             DeakoLastMessageAge(client, config),
             DeakoDevicesReporting(client, config),
+            DeakoUnreachableDevices(client, config),
+            DeakoAsymmetryProbes(client, config),
             DeakoLastProbePass(prober, client, config),
             DeakoProbeWitnessed(prober, client, config),
             DeakoProbeUnwitnessed(prober, client, config),
@@ -96,6 +109,7 @@ async def async_setup_entry(
             entities.append(DeakoNodeStatus(client, uuid))
             entities.append(DeakoLastProbed(prober, client, uuid))
             entities.append(DeakoLastProbeValue(prober, client, uuid))
+            entities.append(DeakoLastProbeOutcome(prober, client, uuid))
         add_entities(entities)
 
     @callback
@@ -455,6 +469,123 @@ class DeakoDevicesReporting(DeakoHubDiagnosticSensor):
         self.schedule_update_ha_state()
 
 
+class DeakoUnreachableDevices(DeakoHubDiagnosticSensor):
+    """How many switches are currently marked `unreachable`.
+
+    The third hub number (wayfinder #43, built in #45), and the one that reads
+    the mark itself rather than a pass. It is `len(get_unreachable())` -- the
+    same set the per-switch node status sensors report one at a time -- so it
+    cannot contradict them. It is a count of the same thing, by construction.
+
+    **Expect it to differ from the probe pair, and do not try to reconcile
+    them.** They answer different questions and they are not even taken at the
+    same moment. This is a *snapshot*: what is marked right now. The pair is a
+    *verdict*: of the devices the last pass wrote to, how many answered. A mark
+    needs two misses, and #26's confirming retry lands 30 s after a pass has
+    already published its numbers -- so a switch that failed a pass is not yet
+    marked when that pass's counts are written, and a switch marked days ago is
+    not in that pass's numbers at all.
+
+    Not restored across a restart, unlike the probe records. The mark lives in
+    memory and is genuinely gone when Home Assistant comes back up, so zero is
+    the truth at that moment rather than a hole -- and restoring a count of
+    marks that no longer exist would be the invention this map keeps warning
+    about.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "devices"
+
+    def __init__(self, client: Deako, entry: ConfigEntry) -> None:
+        """Set up the count."""
+        super().__init__(client, entry, "unreachable_devices")
+
+    @property
+    def native_value(self) -> int:
+        """Return how many switches are marked right now."""
+        return len(self.client.get_unreachable())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose which ones, so the number is followable."""
+        return {"unreachable_uuids": sorted(self.client.get_unreachable())}
+
+    async def async_added_to_hass(self) -> None:
+        """Move whenever a mark is set or lifted."""
+        self.client.add_reachability_listener(self.on_reachability_change)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        self.client.remove_reachability_listener(self.on_reachability_change)
+
+    @callback
+    def on_reachability_change(self, uuid: str, reachable: bool) -> None:
+        """Any device's mark moving changes this count."""
+        self.schedule_update_ha_state()
+
+
+class DeakoAsymmetryProbes(DeakoHubDiagnosticSensor):
+    """The asymmetry measurement, and nothing more (wayfinder #43/#45).
+
+    #43 left one question that twelve days of house history could not settle.
+    A switch marked `unreachable` that then emits an `EVENT` is either
+    **intermittent** -- genuinely reachable for a couple of minutes -- or
+    **asymmetric**, able to report but never to obey, in which case `online`
+    was never true. The median life of a cleared mark is 2.2 minutes, so the
+    hourly pass will nearly always miss the window; the only instrument that
+    fits inside it is a single `CONTROL` sent the instant the `EVENT` lands.
+
+    This reports it. `witnessed` climbing with the total says intermittent;
+    a total that climbs while `witnessed` stays put says asymmetric.
+
+    **It builds no defence and nothing branches on it.** Asymmetry has never
+    been observed and this map does not keep mechanisms against faults nobody
+    has seen -- so if this comes back empty, nothing is built on it and the
+    measurement is what gets deleted.
+
+    It is an entity rather than only a log line because the sample accrues
+    slowly -- these switches clear a few times a day -- and the recorder keeps
+    ordinary history for 60 days while long-term statistics never purge. A log
+    line would be gone before the measurement matured, which is the reason this
+    map preferred entities to log lines in the first place.
+    """
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = "probes"
+
+    def __init__(self, client: Deako, entry: ConfigEntry) -> None:
+        """Set up the count."""
+        super().__init__(client, entry, "asymmetry_probes")
+
+    @property
+    def native_value(self) -> int:
+        """Return how many asymmetry probes have been sent since startup."""
+        probes, _witnessed = self.client.get_asymmetry_counts()
+        return probes
+
+    @property
+    def extra_state_attributes(self) -> dict[str, int]:
+        """Expose the split, which is the whole reading."""
+        probes, witnessed = self.client.get_asymmetry_counts()
+        return {
+            "witnessed": witnessed,
+            "unwitnessed": probes - witnessed,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Move whenever a measurement concludes."""
+        self.client.add_asymmetry_listener(self.on_measurement)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        self.client.remove_asymmetry_listener(self.on_measurement)
+
+    @callback
+    def on_measurement(self) -> None:
+        """Write the new split out."""
+        self.schedule_update_ha_state()
+
+
 class DeakoRestoredProbeReading(RestoreEntity):
     """Carry a probe reading across a restart.
 
@@ -636,6 +767,52 @@ class DeakoLastProbeValue(DeakoProbeNodeSensor):
         return {"dim": None}
 
 
+class DeakoLastProbeOutcome(DeakoProbeNodeSensor):
+    """Whether this switch answered the last pass that wrote to it.
+
+    The third of the per-switch records (wayfinder #43 decision 5, built in
+    #45). `last_probed` says when we wrote and `last_probe_value` says what we
+    sent; neither says whether the switch did anything about it. The pass
+    computed exactly that per uuid and then threw it away into two hub counts,
+    so the only per-device answer available was the node status sensor -- which
+    is a running verdict shaped by two misses and a retry, not a record of one
+    pass.
+
+    #44 named that gap as one of the reasons attributing a light that moved on
+    its own took a week: with a hub count of "2 did not answer" and 37
+    switches, nothing said *which two*.
+
+    `unknown` until a pass that wrote to this switch has concluded, and it then
+    holds that verdict until the next pass concludes. It deliberately does not
+    blank itself when the next pass sends -- an `unknown` stretch through the
+    middle of the record is precisely the failure DeakoRestoredProbeReading
+    exists to prevent -- so it is always read alongside `last_probed`, which
+    says which pass it belongs to.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = PROBE_OUTCOME_OPTIONS
+
+    def __init__(
+        self, prober: DeakoProber, client: Deako, uuid: str,
+    ) -> None:
+        """Bind to one device."""
+        super().__init__(prober, client, uuid, "last_probe_outcome")
+
+    @property
+    def native_value(self) -> str | None:
+        """Return whether it answered, or None if no pass has concluded."""
+        answered = self.prober.get_probe_answered(self.uuid)
+        if answered is not None:
+            return (
+                PROBE_OUTCOME_ANSWERED if answered
+                else PROBE_OUTCOME_NO_ANSWER
+            )
+        if self._restored_state in PROBE_OUTCOME_OPTIONS:
+            return self._restored_state
+        return None
+
+
 class DeakoProbePassSensor(DeakoHubDiagnosticSensor, DeakoRestoredProbeReading):
     """Shared wiring for the hub-level probe readings."""
 
@@ -715,10 +892,12 @@ class DeakoProbeWitnessed(DeakoProbePassSensor):
     nobody knows, and this is the entity that outlives the retention window
     long enough to answer it.
 
-    Counted as a census of the house rather than of the writes: a device the
-    passive detector already heard from this cycle is skipped by the pass and
-    still counts as answering, because a real actuation witnessed it and
-    writing to it again could only tell us what we know.
+    Counted as a census of the writes, which since wayfinder #45 is also a
+    census of the house: every device is written to every pass. #26 skipped a
+    device the passive detector had heard from and counted it as answering
+    anyway, so this number silently included devices nothing had asked -- and
+    on one measured pass that put a switch simultaneously marked `unreachable`
+    inside "35 answering".
     """
 
     _attr_state_class = SensorStateClass.MEASUREMENT

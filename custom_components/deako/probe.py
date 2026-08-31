@@ -107,17 +107,6 @@ class DeakoProber:
         # Governor state, on the monotonic clock: it is only ever read as a
         # difference, and must not move when the wall clock is corrected.
         self._next_due = time.monotonic() + FIRST_PASS_DELAY_S
-        # When the previous pass finished. A device the passive detector
-        # witnessed *since* then needs no write from us: its cache is
-        # device-fresh and probing it could only tell us what we know.
-        #
-        # The end of the previous pass, emphatically not its start. A pass
-        # witnesses nearly every device it touches -- that is what a successful
-        # probe is -- so measuring from the start would let each pass's own
-        # answers excuse the next one, and the probe would write once and then
-        # skip the house forever while reporting a full census. Observed doing
-        # exactly that before this line said "end".
-        self._cycle_end = time.monotonic()
 
         # What the entities read. `last_pass_at` deliberately advances only on
         # a pass that *completed*: its job is to show the probe stopping, so a
@@ -128,6 +117,10 @@ class DeakoProber:
         self._unwitnessed: int | None = None
         self._probed_at: dict[str, datetime] = {}
         self._probe_value: dict[str, tuple[bool, int | None]] = {}
+        # Whether each device answered the last pass that wrote to it
+        # (wayfinder #45). `_conclude_pass` already computes this per uuid and
+        # used to throw it away into two counts.
+        self._probe_answered: dict[str, bool] = {}
 
         self._pass_listeners: list[Callable[[], None]] = []
         self._device_listeners: list[Callable[[str], None]] = []
@@ -223,12 +216,12 @@ class DeakoProber:
 
     @property
     def witnessed(self) -> int | None:
-        """How many devices answered for themselves in the last pass."""
+        """How many of the devices we wrote to answered in the last pass."""
         return self._witnessed
 
     @property
     def unwitnessed(self) -> int | None:
-        """How many devices did not answer in the last pass."""
+        """How many of the devices we wrote to did not answer."""
         return self._unwitnessed
 
     def get_probed_at(self, uuid: str) -> datetime | None:
@@ -238,6 +231,13 @@ class DeakoProber:
     def get_probe_value(self, uuid: str) -> tuple[bool, int | None] | None:
         """The (power, dim) the probe last sent to this device."""
         return self._probe_value.get(uuid)
+
+    def get_probe_answered(self, uuid: str) -> bool | None:
+        """Whether this device answered the last pass that wrote to it.
+
+        None until a pass that wrote to it has concluded (wayfinder #45).
+        """
+        return self._probe_answered.get(uuid)
 
     def add_pass_listener(self, listener: Callable[[], None]) -> None:
         """Register a listener for a pass concluding."""
@@ -336,50 +336,50 @@ class DeakoProber:
         node is the case that decides this: charging only successes would let a
         node that drops the connection mid-pass earn a fresh 37-device attempt
         every time it came back.
+
+        **Every device is written to, every pass** (wayfinder #45). #26 skipped
+        a device the passive detector had heard from since the previous pass
+        ended, and counted it as answering. #43 convicted that rule: at one
+        `22:47:18` pass it skipped 15 of 37 devices, and one of the 15 it
+        counted inside "35 answering" was a switch simultaneously marked
+        `unreachable`. The two numbers on the hub were a *snapshot* including
+        devices nothing had asked, dressed as a *census of the writes*.
+
+        It bought about 17 s of a pass that now costs ~41 s instead of ~24 s,
+        hourly, and cost a cache to maintain, a rule to test and a way to be
+        wrong. Removing it adds no exposure to #44's echo defect either: the
+        devices it skipped were precisely the ones whose cache had *just* been
+        refreshed by a real actuation, which are the writes guaranteed safe.
         """
         async with self._lock:
             self._next_due = time.monotonic() + PROBE_INTERVAL_S
-            cutoff = self._cycle_end
 
             probed: dict[str, float] = {}
-            skipped: list[str] = []
             aborted = False
 
-            try:
-                for uuid in list(self._client.get_devices()):
-                    if not self._client.is_connected():
-                        aborted = True
-                        break
+            for uuid in list(self._client.get_devices()):
+                if not self._client.is_connected():
+                    aborted = True
+                    break
 
-                    witness = self._client.get_last_witness(uuid)
-                    if witness is not None and witness >= cutoff:
-                        # The passive detector already has this one, from a
-                        # real actuation rather than from a write of ours.
-                        skipped.append(uuid)
-                        continue
+                if not await self._probe_device(uuid):
+                    aborted = True
+                    break
+                probed[uuid] = time.monotonic()
+                await asyncio.sleep(PROBE_SPACING_S)
 
-                    if not await self._probe_device(uuid):
-                        aborted = True
-                        break
-                    probed[uuid] = time.monotonic()
-                    await asyncio.sleep(PROBE_SPACING_S)
+            if aborted:
+                _LOGGER.warning(
+                    "The %s probe pass was abandoned after %i of %i "
+                    "devices: the connection to the hub went away",
+                    trigger,
+                    len(probed),
+                    len(self._client.get_devices()),
+                )
+                return
 
-                if aborted:
-                    _LOGGER.warning(
-                        "The %s probe pass was abandoned after %i of %i "
-                        "devices: the connection to the hub went away",
-                        trigger,
-                        len(probed) + len(skipped),
-                        len(self._client.get_devices()),
-                    )
-                    return
-
-                await asyncio.sleep(PASS_SETTLE_S)
-                self._conclude_pass(trigger, probed, skipped)
-            finally:
-                # Closed here rather than at the top, so this pass's own
-                # answers cannot excuse the next one from asking again.
-                self._cycle_end = time.monotonic()
+            await asyncio.sleep(PASS_SETTLE_S)
+            self._conclude_pass(trigger, probed)
 
     async def _probe_device(self, uuid: str) -> bool:
         """Echo one device's cached state back to it, and record that we did.
@@ -410,37 +410,45 @@ class DeakoProber:
         self._notify_device(uuid)
         return True
 
-    def _conclude_pass(
-        self, trigger: str, probed: dict[str, float], skipped: list[str],
-    ) -> None:
+    def _conclude_pass(self, trigger: str, probed: dict[str, float]) -> None:
         """Publish what the pass found.
 
         A device counts as answering if the mesh spoke for it after we wrote to
-        it -- and the ones skipped count as answering too, because the passive
-        detector heard from them this cycle for real. The pair of numbers is a
-        census of the house either way, which is what makes them worth keeping
-        forever.
+        it. With the skip rule gone (wayfinder #45) the pair means exactly what
+        the entity names claim: **of the devices we wrote to, how many
+        answered.** Every device was written to, so it is also a census of the
+        house -- the two readings coincide now instead of being conflated.
+
+        The per-device verdict is kept rather than discarded into the counts
+        (#45, item 4). It was already computed here; #44 spent a week
+        attributing a light that moved partly because nothing recorded whether
+        an individual switch had answered its probe.
         """
-        witnessed = [
+        answered = [
             uuid for uuid, sent_at in probed.items()
             if (seen := self._client.get_last_witness(uuid)) is not None
             and seen >= sent_at
         ]
 
         self._last_pass_at = dt_util.utcnow()
-        self._witnessed = len(skipped) + len(witnessed)
-        self._unwitnessed = len(probed) - len(witnessed)
+        self._witnessed = len(answered)
+        self._unwitnessed = len(probed) - len(answered)
+
+        answered_set = set(answered)
+        for uuid in probed:
+            self._probe_answered[uuid] = uuid in answered_set
 
         log = _LOGGER.warning if self._unwitnessed else _LOGGER.info
         log(
-            "The %s probe pass finished: %i of %i answered (%i were already "
-            "witnessed this cycle and were not written to), %i did not",
+            "The %s probe pass finished: %i of %i devices written to "
+            "answered, %i did not",
             trigger,
             self._witnessed,
-            self._witnessed + self._unwitnessed,
-            len(skipped),
+            len(probed),
             self._unwitnessed,
         )
+        for uuid in probed:
+            self._notify_device(uuid)
         self._notify_pass()
 
     # -- listener plumbing -------------------------------------------------
