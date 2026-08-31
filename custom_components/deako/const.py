@@ -47,6 +47,14 @@ PROBE_VALUE_ON = "on"
 PROBE_VALUE_OFF = "off"
 PROBE_VALUE_OPTIONS = [PROBE_VALUE_ON, PROBE_VALUE_OFF]
 
+# Whether a switch answered the last probe pass that wrote to it (wayfinder
+# #45). The pass already computed this per device and discarded it into two
+# hub counts, which is part of why #44 took a week to attribute one light.
+# `unknown` until a pass that wrote to this switch has concluded.
+PROBE_OUTCOME_ANSWERED = "answered"
+PROBE_OUTCOME_NO_ANSWER = "no_answer"
+PROBE_OUTCOME_OPTIONS = [PROBE_OUTCOME_ANSWERED, PROBE_OUTCOME_NO_ANSWER]
+
 # The address of the hub is a safety control, not a convenience: the house has
 # three Deako nodes, the telnet server is exclusive, and one of the other nodes
 # serves SmartThings. The configured address is the only source of an address --
