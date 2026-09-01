@@ -474,10 +474,26 @@ class DeakoUnreachableDevices(DeakoHubDiagnosticSensor):
 
     The third hub number (wayfinder #43, built in #45), and the one that reads
     the mark itself rather than a pass. It is `len(get_unreachable())` -- the
-    same set the per-switch node status sensors report one at a time -- so it
-    cannot contradict them. It is a count of the same thing, by construction.
+    same set the per-switch node status sensors report one at a time.
 
-    **Expect it to differ from the probe pair, and do not try to reconcile
+    **There is exactly one condition under which it and those sensors disagree,
+    and it is not rare: a hub outage.** `DeakoNodeStatus` makes
+    `hub_disconnected` dominate, on the reasoning that a disconnected hub makes
+    every other reading meaningless -- so while the connection is down, every
+    node reads `hub_disconnected` and *none* reads `unreachable`, while this
+    still counts the marks, because a mark is about the device and survives a
+    reconnect. Measured by hand on the rig: hub killed with one switch marked,
+    this read `1` against zero sensors reading `unreachable`, and they agreed
+    again the moment the connection came back.
+
+    That is deliberate rather than a defect -- this hub's diagnostics are
+    always available precisely so they outlive the outage they describe (#23)
+    -- but it is written down here because it will show in the house
+    routinely: the node that flaps every 6-12 minutes, and the ten drops in
+    thirteen minutes #32 recorded after cutover, are all windows where the
+    dashboard shows a count with nothing to match it against.
+
+    **Expect it to differ from the probe pair too, and do not try to reconcile
     them.** They answer different questions and they are not even taken at the
     same moment. This is a *snapshot*: what is marked right now. The pair is a
     *verdict*: of the devices the last pass wrote to, how many answered. A mark

@@ -28,6 +28,11 @@
 #      **without altering when the mark clears**, and without feeding the
 #      detector it is measuring.
 #
+# Phase 6 is not from the ticket. It was found by bringing this rig up and
+# driving it by hand, which is the bar this map actually sets -- a suite only
+# asks what its author thought of, and its author did not think of a hub
+# outage. See the phase for what it pins down.
+#
 # Phase 4 runs both readings of #43's open question, because a measurement that
 # can only produce one answer is not a measurement:
 #
@@ -208,15 +213,25 @@ start_simulator() {
     fi
     "$WORK_DIR/venvsim/bin/pip" -q install aiohttp zeroconf jsonschema
     cd "$REPO_ROOT"
-    : > "$WORK_DIR/sim.log"
-    "$WORK_DIR/venvsim/bin/python" "$E2E_DIR/zero_dim_sim_runner.py" \
-        --port "$SIM_PORT" --http-port "$SIM_HTTP_PORT" > "$WORK_DIR/sim.log" 2>&1 &
+    local want
+    if [ "${1:-}" = "append" ]; then
+        # Restarting mid-run: the log carries this run's CONTROL history and
+        # the counts below are read from it, so it must not be truncated.
+        want=$(( $(ready_count) + 1 ))
+        "$WORK_DIR/venvsim/bin/python" "$E2E_DIR/zero_dim_sim_runner.py" \
+            --port "$SIM_PORT" --http-port "$SIM_HTTP_PORT" >> "$WORK_DIR/sim.log" 2>&1 &
+    else
+        : > "$WORK_DIR/sim.log"
+        want=1
+        "$WORK_DIR/venvsim/bin/python" "$E2E_DIR/zero_dim_sim_runner.py" \
+            --port "$SIM_PORT" --http-port "$SIM_HTTP_PORT" > "$WORK_DIR/sim.log" 2>&1 &
+    fi
     SIM_PID=$!
     for _ in $(seq 1 30); do
-        [ "$(ready_count)" -ge 1 ] && break
+        [ "$(ready_count)" -ge "$want" ] && break
         sleep 1
     done
-    [ "$(ready_count)" -ge 1 ] || {
+    [ "$(ready_count)" -ge "$want" ] || {
         echo "simulator failed to start"; tail -20 "$WORK_DIR/sim.log"; exit 1; }
 }
 
@@ -658,6 +673,66 @@ sys.exit(0 if ok else 1)
 OUTCOME_OK=$?
 report "$OUTCOME_OK" "the recorder holds the per-switch outcome" \
     "$(cat "$WORK_DIR/outcome_history.txt") -- an attribution record that is only right in memory would not answer a question asked hours later, which is the question it exists for"
+
+# ---------------------------------------------------------------------------
+# Phase 6: what the count does when the hub itself goes away.
+# ---------------------------------------------------------------------------
+#
+# This phase exists because driving the rig by hand found it and the suite did
+# not. The claim originally written on DeakoUnreachableDevices was that it
+# "cannot contradict" the per-switch sensors, "by construction". It can, and
+# the condition is a hub outage: DeakoNodeStatus makes `hub_disconnected`
+# dominate, so every node stops saying `unreachable` while the mark itself
+# survives -- and the house has a node that flaps every 6-12 minutes.
+#
+# The behaviour is deliberate; it is asserted here so it stays deliberate.
+
+echo ""
+echo "== phase 6: the hub goes away while a switch is marked =="
+set_unreachable "$SWITCH_UUID"
+run_census >/dev/null
+P6_MARK_S=$(wait_for_state "$SWITCH_NODE" "unreachable" "$MARK_ARC_S")
+[ "$P6_MARK_S" != "-1" ]; report $? "a switch is marked again" \
+    "$SWITCH_NODE=unreachable after ${P6_MARK_S}s"
+
+P6_MARKED_UP=$(ha_state "$MARKED")
+P6_NODES_UP=$(marked_nodes)
+[ "$P6_MARKED_UP" = "1" ] && [ "$P6_NODES_UP" = "1" ]
+report $? "with the hub up, the two readings agree" \
+    "$MARKED=$P6_MARKED_UP against $P6_NODES_UP sensors reading unreachable"
+
+echo "  killing the hub"
+kill "$SIM_PID" 2>/dev/null
+SIM_PID=""
+for _ in $(seq 1 15); do
+    port_answers "$SIM_IP" "$SIM_PORT" || break
+    sleep 1
+done
+DOWN_S=$(wait_for_state "$HUB_CONNECTED" "off" 40)
+[ "$DOWN_S" != "-1" ]; report $? "the connection is down" "after ${DOWN_S}s"
+
+sleep 3
+P6_MARKED_DOWN=$(ha_state "$MARKED")
+P6_NODES_DOWN=$(marked_nodes)
+P6_NODE_READS=$(ha_state "$SWITCH_NODE")
+[ "$P6_MARKED_DOWN" = "1" ] && [ "$P6_NODES_DOWN" = "0" ] \
+    && [ "$P6_NODE_READS" = "hub_disconnected" ]
+report $? "during the outage the count and the per-switch sensors disagree" \
+    "$MARKED=$P6_MARKED_DOWN against $P6_NODES_DOWN sensors reading unreachable ($SWITCH_NODE=$P6_NODE_READS) -- hub_disconnected dominates on the node, the mark survives on the client, and this is the one condition where the two readings diverge. Found by driving the rig by hand, not by this script"
+
+echo "  bringing the hub back"
+start_simulator append
+BACK_S=$(wait_for_state "$HUB_CONNECTED" "on" 90)
+[ "$BACK_S" != "-1" ]; report $? "the connection comes back" "after ${BACK_S}s"
+
+sleep 3
+P6_MARKED_BACK=$(ha_state "$MARKED")
+P6_NODES_BACK=$(marked_nodes)
+[ "$P6_MARKED_BACK" = "1" ] && [ "$P6_NODES_BACK" = "1" ]
+report $? "and they agree again the moment it returns" \
+    "$MARKED=$P6_MARKED_BACK against $P6_NODES_BACK sensors reading unreachable -- the mark is about the device and survived the outage, so nothing had to re-derive it"
+
+set_unreachable ""
 
 dump_counters "at the end of the run"
 

@@ -1107,6 +1107,20 @@ class Deako:
         nothing here can set or lift a mark. The verdict is read from
         `last_witness` afterwards instead -- the same evidence the probe's own
         pass uses, read without arming the machinery that acts on it.
+
+        **Open question, deliberately not decided here (wayfinder #45).** This
+        is a second writer to the mesh, and unlike the probe's pass it leaves
+        *no* per-switch attribution record: `last_probed` and
+        `last_probe_value` still describe the last census. #25 required probe
+        writes to be attributable precisely because they are invisible in the
+        recorder -- the write drives the light to the value Home Assistant
+        already believes -- and that argument applies here too, since
+        `update_state()` has just written the reported value a moment before.
+        The exposure is small (the echo cannot move a light away from what the
+        device itself has just reported) but it is not nil, and the fix is not
+        obvious: writing `last_probed` here would break the pairing that lets
+        `last_probe_outcome` say which pass it belongs to. Surfaced for the map
+        owner rather than settled in code.
         """
         try:
             state = self.get_state(uuid) or {}
