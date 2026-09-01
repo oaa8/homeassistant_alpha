@@ -490,6 +490,46 @@ async def offline_checks() -> None:
                 f"counts={deako.get_asymmetry_counts()} -- one probe sent, "
                 "no EVENT followed it",
             )
+            last = deako.get_asymmetry_last()
+            check(
+                "#45 the write it sent is attributable",
+                last is not None
+                and last["uuid"] == DIMMABLE_UUID
+                and last["power"] is False
+                and last["dim"] is None
+                and last["witnessed"] is False,
+                f"record={last} -- #25's rule is that a probe write leaves a "
+                "record, because such a write is invisible in the recorder: "
+                "it drives the light to the value Home Assistant already "
+                "believes, so light.X reads the same before and after",
+            )
+
+            # The record has to exist from the moment the bytes leave, not
+            # from when the window closes -- a restart inside the window is
+            # exactly when somebody later asks what moved a light.
+            deako, manager = _stub_deako(send_ok=True)
+            manager.connected = True
+            deako.record_device("Dimmer", DIMMABLE_UUID, True, True, 80)
+            deako.unreachable.add(DIMMABLE_UUID)
+            deako.incoming_json({
+                "type": "EVENT",
+                "data": {
+                    "target": DIMMABLE_UUID,
+                    "state": {"power": True, "dim": 40},
+                },
+            })
+            for _ in range(4):
+                await asyncio.sleep(0)
+            mid = deako.get_asymmetry_last()
+            check(
+                "#45 the record exists while the window is still open",
+                mid is not None
+                and mid["dim"] == 40
+                and mid["witnessed"] is None,
+                f"record={mid} -- written at the send, and witnessed=None is "
+                "'still open', a different fact from 'came back unwitnessed'",
+            )
+            await asyncio.sleep(0.2)
 
             # And the intermittent reading, which is the other half of the
             # question: it reported, and it also obeyed.

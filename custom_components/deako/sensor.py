@@ -564,6 +564,37 @@ class DeakoAsymmetryProbes(DeakoHubDiagnosticSensor):
     ordinary history for 60 days while long-term statistics never purge. A log
     line would be gone before the measurement matured, which is the reason this
     map preferred entities to log lines in the first place.
+
+    **The attributes are an attribution record, not decoration** (wayfinder
+    #45). This measurement sends a real `CONTROL`, and #25's rule is that a
+    probe write must be attributable, because it is invisible in the recorder:
+    it drives the light to the value Home Assistant already believes, so
+    `light.X` reads the same before and after. `last_device` and `last_value`
+    say what left the building, written at the send rather than reconstructed
+    afterwards, so the row exists even if Home Assistant restarts inside the
+    window.
+
+    It deliberately does **not** write the probe pass's `last_probed` pair.
+    Doing so would point that timestamp at a write which produced no pass
+    outcome, and `DeakoLastProbeOutcome` is read against it to know which pass
+    a verdict belongs to.
+
+    `last_witnessed` is `None` while the window is open -- a different fact
+    from a measurement that came back unwitnessed. The two counts, not these
+    attributes, are the tally: the attributes describe the most recent write
+    only.
+
+    **Reading the verdict back out of history takes one query parameter.** The
+    write increments this sensor's state, so it lands as an ordinary recorded
+    row; the verdict arrives five seconds later and changes attributes only, so
+    the default history view -- and the Home Assistant history UI -- collapses
+    it, and every row then reads `last_witnessed: None` as though nothing ever
+    resolved. Ask with `significant_changes_only=0` and both rows are there.
+    Measured on the rig: 3 rows by default against 5 with the flag, the extra
+    two carrying `witnessed=False`. Nothing is lost either way -- each write is
+    its own row, so an overwrite by a later measurement cannot bury an earlier
+    one -- but the default reading is misleading and it is worth knowing before
+    somebody concludes the instrument is broken.
     """
 
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
@@ -580,13 +611,31 @@ class DeakoAsymmetryProbes(DeakoHubDiagnosticSensor):
         return probes
 
     @property
-    def extra_state_attributes(self) -> dict[str, int]:
-        """Expose the split, which is the whole reading."""
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose the split, and what the last measurement wrote."""
         probes, witnessed = self.client.get_asymmetry_counts()
-        return {
+        attrs: dict[str, object] = {
             "witnessed": witnessed,
             "unwitnessed": probes - witnessed,
         }
+        last = self.client.get_asymmetry_last()
+        if last is None:
+            attrs.update({
+                "last_device": None,
+                "last_device_uuid": None,
+                "last_value": None,
+                "last_dim": None,
+                "last_witnessed": None,
+            })
+            return attrs
+        attrs.update({
+            "last_device": last["name"],
+            "last_device_uuid": last["uuid"],
+            "last_value": PROBE_VALUE_ON if last["power"] else PROBE_VALUE_OFF,
+            "last_dim": last["dim"],
+            "last_witnessed": last["witnessed"],
+        })
+        return attrs
 
     async def async_added_to_hass(self) -> None:
         """Move whenever a measurement concludes."""
