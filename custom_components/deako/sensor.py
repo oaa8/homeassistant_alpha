@@ -20,13 +20,15 @@ Wayfinder #39 adds **unacknowledged commands** on the hub: commands the hub
 never answered at all. It is deliberately a different question from the node
 status sensor's -- see DeakoDroppedCommands.
 
-Wayfinder #45 adds a third per-switch record, **last probe outcome**, and two
+Wayfinder #45 adds a third per-switch record, **last probe outcome**, and three
 more hub readings: **switches marked unreachable**, which counts the same set
-the per-switch sensors report one at a time, and **asymmetry probes**, which is
-a measurement of an open question rather than a diagnostic. Read
-DeakoUnreachableDevices on why the marked count and the probe pair are supposed
-to differ, and DeakoAsymmetryProbes on what is being measured and what happens
-if it comes back empty.
+the per-switch sensors report one at a time, and **asymmetry probes** plus
+**asymmetry probes witnessed**, which are a measurement of an open question
+rather than a diagnostic. Read DeakoUnreachableDevices on why the marked count
+and the probe pair are supposed to differ, DeakoAsymmetryProbes on what is
+being measured and what happens if it comes back empty, and
+DeakoAsymmetryWitnessed on why the split is two entity states rather than two
+attributes.
 
 What the node status sensor honestly cannot say is set out on
 DeakoNodeStatus below. Read it before building anything on top of this.
@@ -90,6 +92,7 @@ async def async_setup_entry(
             DeakoDevicesReporting(client, config),
             DeakoUnreachableDevices(client, config),
             DeakoAsymmetryProbes(client, config),
+            DeakoAsymmetryWitnessed(client, config),
             DeakoLastProbePass(prober, client, config),
             DeakoProbeWitnessed(prober, client, config),
             DeakoProbeUnwitnessed(prober, client, config),
@@ -551,28 +554,39 @@ class DeakoAsymmetryProbes(DeakoHubDiagnosticSensor):
     hourly pass will nearly always miss the window; the only instrument that
     fits inside it is a single `CONTROL` sent the instant the `EVENT` lands.
 
-    This reports it. `witnessed` climbing with the total says intermittent;
-    a total that climbs while `witnessed` stays put says asymmetric.
+    This reports it, as **two counts that are both entity states**, and that
+    is the whole design rather than a detail. `witnessed` climbing with the
+    total says intermittent; a total that climbs while `witnessed` stays put
+    says asymmetric.
+
+    **The split has to be two states, because long-term statistics only keep a
+    state.** This map preferred entities to log lines because the recorder
+    holds 60 days while statistics never purge (#10, #23), and the sample here
+    accrues a few clears a day -- so the question is asked months later by
+    construction. Asked directly, Home Assistant stores a statistics row of
+    `state`, `sum`, `change`, `last_reset` and **no attributes at all**: a
+    split carried in attributes would leave "847 probes sent" as the only
+    surviving fact, which cannot separate the two readings and is therefore
+    not a measurement. So the witnessed count is `DeakoAsymmetryWitnessed`
+    beside this one, and `unwitnessed` is the difference of two series that
+    both outlive the retention window.
 
     **It builds no defence and nothing branches on it.** Asymmetry has never
     been observed and this map does not keep mechanisms against faults nobody
     has seen -- so if this comes back empty, nothing is built on it and the
     measurement is what gets deleted.
 
-    It is an entity rather than only a log line because the sample accrues
-    slowly -- these switches clear a few times a day -- and the recorder keeps
-    ordinary history for 60 days while long-term statistics never purge. A log
-    line would be gone before the measurement matured, which is the reason this
-    map preferred entities to log lines in the first place.
+    **The attributes are an attribution record, not the measurement** (wayfinder
+    #45). This sends a real `CONTROL`, and #25's rule is that a probe write
+    must be attributable, because it is invisible in the recorder: it drives
+    the light to the value Home Assistant already believes, so `light.X` reads
+    the same before and after. `last_device` and `last_value` say what left the
+    building, written at the send rather than reconstructed afterwards, so the
+    row exists even if Home Assistant restarts inside the window.
 
-    **The attributes are an attribution record, not decoration** (wayfinder
-    #45). This measurement sends a real `CONTROL`, and #25's rule is that a
-    probe write must be attributable, because it is invisible in the recorder:
-    it drives the light to the value Home Assistant already believes, so
-    `light.X` reads the same before and after. `last_device` and `last_value`
-    say what left the building, written at the send rather than reconstructed
-    afterwards, so the row exists even if Home Assistant restarts inside the
-    window.
+    Attributes are the right home for *that* job and the wrong one for the
+    split above: attribution is a question asked within days of a light moving,
+    comfortably inside the 60 days ordinary history keeps.
 
     It deliberately does **not** write the probe pass's `last_probed` pair.
     Doing so would point that timestamp at a write which produced no pass
@@ -648,6 +662,57 @@ class DeakoAsymmetryProbes(DeakoHubDiagnosticSensor):
     @callback
     def on_measurement(self) -> None:
         """Write the new split out."""
+        self.schedule_update_ha_state()
+
+
+class DeakoAsymmetryWitnessed(DeakoHubDiagnosticSensor):
+    """How many asymmetry measurements the switch actually answered.
+
+    The other half of the measurement, and a state rather than an attribute
+    for one reason: **long-term statistics keep a state and nothing else.**
+    Asked directly, Home Assistant stores `state`, `sum`, `change` and
+    `last_reset` per statistics row, with no attributes -- so a split carried
+    on `DeakoAsymmetryProbes` alone would purge with ordinary history at 60
+    days, leaving a total number of probes that cannot separate #43's two
+    readings from each other.
+
+    Read against its twin: climbing together is **intermittent**, a total
+    climbing while this stays flat is **asymmetric**. Both series outlive the
+    retention window, so the question can still be answered by somebody who
+    asks it next year -- which is the timescale this instrument was built for,
+    since a marked switch clears only a few times a day.
+
+    Deliberately the witnessed count rather than the unwitnessed one. Both
+    would do, since the pair and the difference carry the same information, but
+    a `TOTAL_INCREASING` series that stays at zero is the asymmetric reading
+    showing itself plainly, and a flat line is easier to trust than a line that
+    tracks its twin.
+    """
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = "probes"
+
+    def __init__(self, client: Deako, entry: ConfigEntry) -> None:
+        """Set up the count."""
+        super().__init__(client, entry, "asymmetry_witnessed")
+
+    @property
+    def native_value(self) -> int:
+        """Return how many measurements were answered."""
+        _probes, witnessed = self.client.get_asymmetry_counts()
+        return witnessed
+
+    async def async_added_to_hass(self) -> None:
+        """Move whenever a measurement concludes."""
+        self.client.add_asymmetry_listener(self.on_measurement)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        self.client.remove_asymmetry_listener(self.on_measurement)
+
+    @callback
+    def on_measurement(self) -> None:
+        """Write the new count out."""
         self.schedule_update_ha_state()
 
 
