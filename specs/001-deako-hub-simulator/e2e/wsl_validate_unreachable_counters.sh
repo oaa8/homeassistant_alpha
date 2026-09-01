@@ -556,6 +556,7 @@ echo ""
 echo "== phase 3: an EVENT arrives from a marked switch that cannot obey =="
 P3_ASYM_BEFORE=$(ha_state "$ASYMMETRY")
 P3_CONTROLS_BEFORE=$(controls_for "$SWITCH_UUID")
+P3_PROBED_BEFORE=$(ha_state "$SWITCH_PROBED")
 
 curl -s -X POST "$SIM_HTTP/api/devices/$SWITCH_UUID/state" \
     -H "Content-Type: application/json" -d '{"power": true}' > "$WORK_DIR/event.json"
@@ -581,6 +582,22 @@ P3_UNWITNESSED=$(ha_attr "$ASYMMETRY" unwitnessed)
 [ "$P3_UNWITNESSED" = "1" ] && [ "$P3_WITNESSED" = "0" ]
 report $? "an unanswered measurement is recorded as unwitnessed" \
     "witnessed=$P3_WITNESSED unwitnessed=$P3_UNWITNESSED -- this fixture reports but cannot obey, which is #43's asymmetric reading"
+
+# The attribution record. #25's rule is that a probe write leaves one, because
+# such a write is invisible in the recorder: it drives the light to the value
+# Home Assistant already believes, so `light.X` reads the same either side.
+P3_LAST_UUID=$(ha_attr "$ASYMMETRY" last_device_uuid)
+P3_LAST_VALUE=$(ha_attr "$ASYMMETRY" last_value)
+P3_LAST_SEEN=$(ha_attr "$ASYMMETRY" last_witnessed)
+[ "$P3_LAST_UUID" = "$SWITCH_UUID" ] && [ "$P3_LAST_VALUE" = "on" ] \
+    && [ "$P3_LAST_SEEN" = "False" ]
+report $? "the write the measurement sent is attributable" \
+    "last_device_uuid=$P3_LAST_UUID last_value=$P3_LAST_VALUE last_witnessed=$P3_LAST_SEEN -- this is a real CONTROL that can move a light, and without this it would be the one class of write nothing could account for"
+
+P3_PROBED_AFTER=$(ha_state "$SWITCH_PROBED")
+[ "$P3_PROBED_AFTER" = "$P3_PROBED_BEFORE" ]
+report $? "and it leaves the pass's own record alone" \
+    "$SWITCH_PROBED still $P3_PROBED_AFTER -- bumping it would point that timestamp at a write which produced no pass outcome, and $SWITCH_OUTCOME is read against it to know which pass its verdict belongs to"
 
 grep -q "Asymmetry measurement on $SWITCH_UUID" "$HA_DIR/ha.log"
 report $? "and it says so in the log too" \
@@ -673,6 +690,41 @@ sys.exit(0 if ok else 1)
 OUTCOME_OK=$?
 report "$OUTCOME_OK" "the recorder holds the per-switch outcome" \
     "$(cat "$WORK_DIR/outcome_history.txt") -- an attribution record that is only right in memory would not answer a question asked hours later, which is the question it exists for"
+
+# Same argument, applied to the measurement's own write. The attributes have to
+# be in the recorder, not merely on the entity now -- and the verdict has to be
+# recoverable, which takes a query parameter the default view does not use.
+python3 -c "
+import json, subprocess, sys
+
+def hist(extra):
+    out = subprocess.run(
+        ['curl', '-s',
+         '$BASE/api/history/period?filter_entity_id=$ASYMMETRY' + extra,
+         '-H', '$AUTH'],
+        capture_output=True, text=True).stdout
+    try:
+        return [p for run in json.loads(out) for p in run]
+    except Exception as exc:
+        print(f'unreadable: {exc}')
+        sys.exit(1)
+
+default_rows = hist('')
+all_rows = hist('&significant_changes_only=0')
+
+writes = [p for p in default_rows if p.get('attributes', {}).get('last_device_uuid')]
+verdicts = [p for p in all_rows
+            if p.get('attributes', {}).get('last_witnessed') is not None]
+
+named = sorted({p['attributes']['last_device'] for p in writes})
+print(f'{len(writes)} write(s) recorded by default, naming {named}; '
+      f'{len(verdicts)} verdict row(s) once significant_changes_only=0 is asked for '
+      f'({len(default_rows)} rows by default vs {len(all_rows)} with the flag)')
+sys.exit(0 if writes and verdicts else 1)
+" > "$WORK_DIR/asym_history.txt"
+ASYM_HIST_OK=$?
+report "$ASYM_HIST_OK" "the recorder holds the write, and the verdict is recoverable" \
+    "$(cat "$WORK_DIR/asym_history.txt") -- the write increments the state so it is an ordinary row, but the verdict lands 5s later as an attribute-only change and the default view collapses it. Found by reading the history by hand and noticing every row said witnessed=None"
 
 # ---------------------------------------------------------------------------
 # Phase 6: what the count does when the hub itself goes away.

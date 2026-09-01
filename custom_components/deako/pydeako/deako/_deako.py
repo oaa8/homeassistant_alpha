@@ -243,6 +243,12 @@ class Deako:
         self.pending_asymmetry: dict[str, asyncio.Task] = {}
         self.asymmetry_probes = 0
         self.asymmetry_witnessed = 0
+        # DEVIATION (wayfinder #45): the attribution record for the write the
+        # measurement sends. Its own, rather than the probe pass's
+        # `last_probed` pair: bumping that would point a timestamp at a write
+        # that produced no pass outcome, and `last_probe_outcome` is read
+        # against it to know which pass a verdict belongs to.
+        self.asymmetry_last: dict[str, Any] | None = None
         self.asymmetry_listeners: list[Callable[[], None]] = []
 
     def add_connection_listener(
@@ -1073,6 +1079,15 @@ class Deako:
         """Return (probes sent, probes witnessed) for the measurement."""
         return self.asymmetry_probes, self.asymmetry_witnessed
 
+    def get_asymmetry_last(self) -> dict[str, Any] | None:
+        """Return the attribution record for the most recent measurement.
+
+        DEVIATION (wayfinder #45). `witnessed` is None while the window is
+        still open, which is a different fact from a measurement that came back
+        unwitnessed -- and the running counts, not this, are the tally.
+        """
+        return self.asymmetry_last
+
     def probe_asymmetry(self, uuid: str) -> None:
         """Ask a just-spoken marked switch whether it can also obey.
 
@@ -1108,19 +1123,14 @@ class Deako:
         `last_witness` afterwards instead -- the same evidence the probe's own
         pass uses, read without arming the machinery that acts on it.
 
-        **Open question, deliberately not decided here (wayfinder #45).** This
-        is a second writer to the mesh, and unlike the probe's pass it leaves
-        *no* per-switch attribution record: `last_probed` and
-        `last_probe_value` still describe the last census. #25 required probe
-        writes to be attributable precisely because they are invisible in the
-        recorder -- the write drives the light to the value Home Assistant
-        already believes -- and that argument applies here too, since
-        `update_state()` has just written the reported value a moment before.
-        The exposure is small (the echo cannot move a light away from what the
-        device itself has just reported) but it is not nil, and the fix is not
-        obvious: writing `last_probed` here would break the pairing that lets
-        `last_probe_outcome` say which pass it belongs to. Surfaced for the map
-        owner rather than settled in code.
+        **It is a write, so it is attributable** (wayfinder #45). This is a
+        second writer to the mesh, and #25's rule is that a probe write leaves
+        a record, because such a write is invisible in the recorder -- it
+        drives the light to the value Home Assistant already believes. The
+        record is its own rather than the pass's `last_probed` pair, which
+        would otherwise point at a write that produced no pass outcome, and is
+        written at the send rather than on completion, so a restart inside the
+        window cannot take the evidence of the write with it.
         """
         try:
             state = self.get_state(uuid) or {}
@@ -1139,12 +1149,32 @@ class Deako:
                 return
 
             self.asymmetry_probes += 1
+            # Written and published *here*, the moment the bytes are away,
+            # rather than reconstructed when the window closes (wayfinder #45,
+            # following #25's rule for the probe pass's own record). This is a
+            # command that can physically move a light, and it is invisible in
+            # the recorder for the same reason the pass's writes are -- it
+            # drives the light to the value Home Assistant already believes. A
+            # record written only on completion would be lost by a restart
+            # inside the window, which is exactly when somebody would later ask
+            # what moved a light.
+            record: dict[str, Any] = {
+                "uuid": uuid,
+                "name": self.get_name(uuid),
+                "power": power,
+                "dim": dim,
+                "witnessed": None,
+            }
+            self.asymmetry_last = record
+            self.notify_asymmetry_listeners()
+
             await asyncio.sleep(ASYMMETRY_WINDOW_S)
 
             seen = self.last_witness.get(uuid)
             witnessed = seen is not None and seen >= sent_at
             if witnessed:
                 self.asymmetry_witnessed += 1
+            record["witnessed"] = witnessed
             _LOGGER.warning(
                 "Asymmetry measurement on %s: it reported, and the CONTROL "
                 "sent straight back at it was %s (%i of %i witnessed so far)",
@@ -1153,7 +1183,12 @@ class Deako:
                 self.asymmetry_witnessed,
                 self.asymmetry_probes,
             )
-            self.notify_asymmetry_listeners()
+            # A measurement on another device may have started meanwhile and
+            # taken the slot, in which case the newer write is the one worth
+            # showing. The verdict is not lost -- it is in the counts and in
+            # the line above.
+            if self.asymmetry_last is record:
+                self.notify_asymmetry_listeners()
         finally:
             self.pending_asymmetry.pop(uuid, None)
 
