@@ -68,6 +68,9 @@
       "asymmetry_probes": {
         "name": "Asymmetry probes"
       },
+      "asymmetry_witnessed": {
+        "name": "Asymmetry witnessed"
+      },
       "last_probed": {
         "name": "Last probed"
       },

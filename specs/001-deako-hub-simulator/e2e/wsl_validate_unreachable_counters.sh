@@ -101,6 +101,7 @@ SWITCH_PROBED="sensor.zero_dim_test_switch_last_probed"
 # The three entities #45 adds.
 MARKED="sensor.deako_hub_switches_marked_unreachable"
 ASYMMETRY="sensor.deako_hub_asymmetry_probes"
+ASYM_SEEN="sensor.deako_hub_asymmetry_witnessed"
 DIMMER_OUTCOME="sensor.zero_dim_test_dimmer_last_probe_outcome"
 SWITCH_OUTCOME="sensor.zero_dim_test_switch_last_probe_outcome"
 
@@ -444,12 +445,12 @@ curl -s -X POST "$BASE/api/config/config_entries/flow/$FLOW_ID" -H "$AUTH" \
 sleep 8
 
 MISSING=""
-for entity in "$MARKED" "$ASYMMETRY" "$DIMMER_OUTCOME" "$SWITCH_OUTCOME"; do
+for entity in "$MARKED" "$ASYMMETRY" "$ASYM_SEEN" "$DIMMER_OUTCOME" "$SWITCH_OUTCOME"; do
     state=$(ha_state "$entity")
     [ "$state" = "missing" ] && MISSING="$MISSING $entity"
 done
-[ -z "$MISSING" ]; report $? "the three new entity types were created" \
-    "${MISSING:-$MARKED, $ASYMMETRY, and one outcome sensor per switch}"
+[ -z "$MISSING" ]; report $? "the new entity types were created" \
+    "${MISSING:-$MARKED, $ASYMMETRY, $ASYM_SEEN, and one outcome sensor per switch}"
 
 START_MARKED=$(ha_state "$MARKED")
 [ "$START_MARKED" = "0" ]; report $? \
@@ -648,9 +649,49 @@ CLEAR2_S=$(wait_for_state "$SWITCH_NODE" "online" 15)
 sleep $((WITNESS_WINDOW_S + 3))
 P4_ASYM_AFTER=$(ha_state "$ASYMMETRY")
 P4_WITNESSED=$(ha_attr "$ASYMMETRY" witnessed)
-[ "$P4_ASYM_AFTER" = "$((P4_ASYM_BEFORE + 1))" ] && [ "$P4_WITNESSED" = "1" ]
+P4_SEEN_STATE=$(ha_state "$ASYM_SEEN")
+[ "$P4_ASYM_AFTER" = "$((P4_ASYM_BEFORE + 1))" ] && [ "$P4_WITNESSED" = "1" ] \
+    && [ "$P4_SEEN_STATE" = "1" ]
 report $? "a measurement the switch answers is recorded as witnessed" \
-    "$ASYMMETRY ${P4_ASYM_BEFORE}->${P4_ASYM_AFTER}, witnessed=$P4_WITNESSED -- the instrument can produce both answers, which is what makes it a measurement rather than a foregone conclusion"
+    "$ASYMMETRY ${P4_ASYM_BEFORE}->${P4_ASYM_AFTER}, $ASYM_SEEN=$P4_SEEN_STATE -- the instrument can produce both answers, which is what makes it a measurement rather than a foregone conclusion"
+
+# The split has to be two entity STATES, not two attributes. Long-term
+# statistics keep a state and nothing else, and this measurement is read months
+# later by construction -- a marked switch clears only a few times a day.
+python3 -c "
+import subprocess, sys
+# The HA virtualenv, because `websockets` ships with Home Assistant and the
+# system interpreter has no reason to carry it. statistics_during_period and
+# list_statistic_ids are websocket-only -- there is no REST equivalent.
+code = '''
+import asyncio, json, sys, websockets
+
+async def ask():
+    async with websockets.connect(\"ws://127.0.0.1:$HA_PORT/api/websocket\", max_size=None) as w:
+        await w.recv()
+        await w.send(json.dumps({\"type\": \"auth\", \"access_token\": \"$TOKEN\"}))
+        if json.loads(await w.recv()).get(\"type\") != \"auth_ok\":
+            return None
+        await w.send(json.dumps({\"id\": 1, \"type\": \"recorder/list_statistic_ids\"}))
+        while True:
+            m = json.loads(await w.recv())
+            if m.get(\"id\") == 1:
+                return m.get(\"result\", [])
+
+ids = asyncio.run(ask())
+if ids is None:
+    print(\"auth refused\"); sys.exit(1)
+want = {\"$ASYMMETRY\", \"$ASYM_SEEN\"}
+have = {r[\"statistic_id\"] for r in ids} & want
+missing = want - have
+print(\", \".join(sorted(have)) or \"none\", \"| missing:\", \", \".join(sorted(missing)) or \"none\")
+sys.exit(0 if not missing else 1)
+'''
+sys.exit(subprocess.run(['$VENV/bin/python', '-c', code]).returncode)
+" > "$WORK_DIR/lts.txt" 2>&1
+LTS_OK=$?
+report "$LTS_OK" "both halves of the measurement outlive the retention window" \
+    "$(cat "$WORK_DIR/lts.txt") -- a statistics row carries state, sum, change and last_reset and no attributes at all, so a split kept in attributes would purge at 60 days and leave a total that cannot separate intermittent from asymmetric. Measured by asking Home Assistant, after writing a docstring that claimed the opposite"
 
 # ---------------------------------------------------------------------------
 # Phase 5: the per-switch outcome is in the recorder, not just in memory.
